@@ -271,6 +271,38 @@ func TestBuildPPTXJSONSections_ExtractsSlideImagesInOrder(t *testing.T) {
 	}
 }
 
+func TestBuildPPTXJSONSections_PreservesSlideGeometry(t *testing.T) {
+	imageData := officeTestPNG(t, 7)
+	irJSON := `{"sections":[{"page_setup":{"width_twips":19200,"height_twips":10800},"elements":[
+		{"type":"text_box","x_emu":-100,"y_emu":200,"width_emu":3000,"height_emu":4000,"content":[
+			{"type":"paragraph","content":[{"type":"text","text":"positioned"}]},
+			{"type":"image","display_width_emu":2500,"display_height_emu":3500,"data":"` + base64.StdEncoding.EncodeToString(imageData) + `"}
+		]}
+	]}]}`
+	sink, _ := officeMediaTestSink(t, officeMediaFormatPPTX)
+	items, err := buildPPTXJSONSections(irJSON, sink)
+	if err != nil || sink.err != nil {
+		t.Fatalf("build geometry: %v / %v", err, sink.err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want positioned text and image", items)
+	}
+	for i, item := range items {
+		if item[presentationCanvasWidthKey] != int64(12192000) || item[presentationCanvasHeightKey] != int64(6858000) {
+			t.Fatalf("item %d canvas = %#v", i, item)
+		}
+		if item[presentationElementXKey] != int64(-100) || item[presentationElementYKey] != int64(200) {
+			t.Fatalf("item %d origin = %#v", i, item)
+		}
+	}
+	if items[0][presentationElementWidthKey] != int64(3000) || items[0][presentationElementHeightKey] != int64(4000) {
+		t.Fatalf("text geometry = %#v", items[0])
+	}
+	if items[1][presentationElementWidthKey] != int64(2500) || items[1][presentationElementHeightKey] != int64(3500) {
+		t.Fatalf("image display geometry = %#v", items[1])
+	}
+}
+
 // TestItemsAllEmpty pins the all-empty fallback gate: empty and whitespace
 // items trigger the PlainText salvage, any non-empty item does not.
 func TestItemsAllEmpty(t *testing.T) {

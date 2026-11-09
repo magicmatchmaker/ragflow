@@ -40,8 +40,18 @@ type docxIRDocument struct {
 }
 
 type docxIRSection struct {
-	Title    string          `json:"title"`
-	Elements []docxIRElement `json:"elements"`
+	Title     string          `json:"title"`
+	PageSetup docxIRPageSetup `json:"page_setup"`
+	Elements  []docxIRElement `json:"elements"`
+}
+
+// docxIRPageSetup is shared by the office_oxide IR families. Presentations
+// expose the slide canvas through the Word-compatible twip fields (one twip is
+// 635 EMU). Keeping the dimensions here lets the Presentation chunker compose
+// one bounded preview for the entire slide without reopening the source PPTX.
+type docxIRPageSetup struct {
+	WidthTwips  int64 `json:"width_twips"`
+	HeightTwips int64 `json:"height_twips"`
 }
 
 type docxIRElement struct {
@@ -54,6 +64,16 @@ type docxIRElement struct {
 	Rows    []docxIRRow      `json:"rows"`    // table rows
 	Ordered bool             `json:"ordered"` // true=numbered list, false=bullet list (for "list" type)
 	Items   []docxIRListItem `json:"items"`   // list items (for "list" type)
+
+	// Presentation geometry. office_oxide emits these fields on text boxes;
+	// images inside a text box inherit that box's origin while their display
+	// dimensions can refine its extent. DOCX callers ignore the zero values.
+	XEMU             int64 `json:"x_emu"`
+	YEMU             int64 `json:"y_emu"`
+	WidthEMU         int64 `json:"width_emu"`
+	HeightEMU        int64 `json:"height_emu"`
+	DisplayWidthEMU  int64 `json:"display_width_emu"`
+	DisplayHeightEMU int64 `json:"display_height_emu"`
 }
 
 // contentRuns decodes Content as flat text runs (paragraph/heading type).

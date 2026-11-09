@@ -27,8 +27,15 @@ package chunker
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"go.uber.org/zap"
 
 	"ragflow/internal/agent/runtime"
+	"ragflow/internal/common"
+	deepdoctype "ragflow/internal/deepdoc/parser/type"
 	"ragflow/internal/ingestion/component/schema"
 
 	"gorm.io/gorm"
@@ -65,11 +72,11 @@ func (c *PageChunkerComponent) Inputs() map[string]string { return ChunkerInputs
 func (c *PageChunkerComponent) Outputs() map[string]string { return ChunkerOutputs }
 
 func (c *PageChunkerComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
-	return c.invoke(ctx, inputs)
+	return c.invoke(ctx, db, inputs)
 }
 
-// invoke emits one chunk per decoded upstream item (slide or page).
-func (c *PageChunkerComponent) invoke(_ context.Context, inputs map[string]any) (map[string]any, error) {
+// invoke emits one chunk per decoded upstream slide or page.
+func (c *PageChunkerComponent) invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	if inputs == nil {
 		return emptyOutputs(), nil
 	}
@@ -78,14 +85,16 @@ func (c *PageChunkerComponent) invoke(_ context.Context, inputs map[string]any) 
 		return inputErrorOutput(err), nil
 	}
 
-	// The Page chunker preserves one incoming JSON item per output chunk.
-	// It has no file-family restriction: item granularity is determined by
-	// the upstream parser backend.
 	items := slideItems(upstream.JSONResult, upstream.Chunks)
 	if len(items) == 0 {
 		return emptyOutputs(), nil
 	}
-	return chunkOutputs(items), nil
+	isPDF := isPDFPresentation(upstream)
+	chunks := mergePresentationPages(ctx, items, !isPDF)
+	if isPDF {
+		chunks = attachPDFPagePreviews(ctx, db, upstream, chunks)
+	}
+	return chunkOutputs(chunks), nil
 }
 
 // slideItems returns the per-slide records, preferring JSONResult and
@@ -95,6 +104,154 @@ func slideItems(items, chunks []schema.ChunkDoc) []schema.ChunkDoc {
 		return items
 	}
 	return chunks
+}
+
+// mergePresentationPages consolidates the parser's text, table and image
+// records into the Presentation contract: one retrievable chunk per slide or
+// page. Items without page identity retain their historical one-item
+// granularity instead of being accidentally merged into one document chunk.
+func mergePresentationPages(ctx context.Context, items []schema.ChunkDoc, enableOCR bool) []schema.ChunkDoc {
+	type pageGroup struct {
+		page  int
+		items []schema.ChunkDoc
+	}
+	groups := make([]pageGroup, 0, len(items))
+	byPage := make(map[int]int)
+	for i := range items {
+		page, identified := presentationPageNumber(items[i])
+		if !identified {
+			groups = append(groups, pageGroup{items: []schema.ChunkDoc{items[i]}})
+			continue
+		}
+		groupIndex, ok := byPage[page]
+		if !ok {
+			groupIndex = len(groups)
+			byPage[page] = groupIndex
+			groups = append(groups, pageGroup{page: page})
+		}
+		groups[groupIndex].items = append(groups[groupIndex].items, items[i])
+	}
+
+	out := make([]schema.ChunkDoc, 0, len(groups))
+	var ocrAnalyzer deepdoctype.DocAnalyzer
+	var ocrAnalyzerErr error
+	ocrAnalyzerResolved := false
+	for _, group := range groups {
+		merged := group.items[0]
+		var textParts []string
+		var image, imgID string
+		var mediaRef = merged.MediaRef
+		for _, item := range group.items {
+			if text := strings.TrimSpace(item.Text); text != "" {
+				textParts = append(textParts, text)
+			}
+			if image == "" {
+				image = item.Image
+			}
+			if imgID == "" {
+				imgID = item.ImgID
+			}
+			if mediaRef == nil {
+				mediaRef = item.MediaRef
+			}
+		}
+		merged.Text = strings.Join(textParts, "\n\n")
+		merged.Image, merged.ImgID, merged.MediaRef = image, imgID, mediaRef
+		merged.TableData = nil
+
+		previewItems := group.items
+		fallbackText := ""
+		if len(textParts) == 0 && group.page > 0 {
+			fallbackText = fmt.Sprintf("[Page %d]", group.page)
+			// The synthetic label is preview text only. It must not inherit the
+			// first source item's media or geometry: doing so would redraw that
+			// image on top of later z-order items and could cover the full slide
+			// with the text backing rectangle.
+			fallback := schema.ChunkDoc{Text: fallbackText, DocType: "text"}
+			previewItems = append(append([]schema.ChunkDoc(nil), group.items...), fallback)
+		}
+		preview, mediaCount, previewErr := composePresentationPreview(ctx, previewItems)
+		if previewErr != nil {
+			common.Warn("PageChunker: presentation preview was partially or completely unavailable",
+				zap.Int("page", group.page), zap.Int("media_items", mediaCount), zap.Error(previewErr))
+		}
+		if len(preview) > 0 {
+			stored, err := storePresentationPreview(ctx, preview)
+			if err != nil {
+				common.Warn("PageChunker: presentation preview cache write failed; retaining searchable text",
+					zap.Int("page", group.page), zap.Int("media_items", mediaCount), zap.Error(err))
+				merged.Image, merged.ImgID, merged.MediaRef = "", "", nil
+			} else if stored != nil {
+				merged.Image, merged.ImgID, merged.MediaRef = stored.Image, "", stored.MediaRef
+			}
+		} else if mediaCount > 0 {
+			// Invalid or unsupported slide media must not turn a recoverable deck
+			// into a failed ingestion. The merged searchable text remains.
+			merged.Image, merged.ImgID, merged.MediaRef = "", "", nil
+		}
+		if enableOCR && mediaCount > 0 && len(preview) > 0 {
+			if !ocrAnalyzerResolved {
+				ocrAnalyzer, ocrAnalyzerErr = resolvePresentationOCRAnalyzer()
+				ocrAnalyzerResolved = true
+				if ocrAnalyzerErr != nil {
+					common.Warn("PageChunker: local presentation OCR is unavailable; retaining parser text and preview", zap.Error(ocrAnalyzerErr))
+				}
+			}
+			if ocrAnalyzer != nil {
+				ocrText, err := extractPresentationOCR(ctx, preview, ocrAnalyzer)
+				if err != nil {
+					common.Warn("PageChunker: local presentation OCR failed; retaining parser text and preview",
+						zap.Int("page", group.page), zap.Error(err))
+				} else {
+					merged.Text = mergePresentationOCR(merged.Text, ocrText)
+				}
+			}
+		}
+		if merged.Text == "" {
+			merged.Text = fallbackText
+		}
+		if merged.Image != "" || merged.ImgID != "" || merged.MediaRef != nil {
+			merged.DocType = "image"
+		} else {
+			merged.DocType = "text"
+		}
+		if group.page > 0 {
+			page := group.page
+			merged.PageNumber = &page
+			_ = merged.SetExtraValue("slide_number", page)
+		}
+		clearPresentationPreviewMetadata(&merged)
+		out = append(out, merged)
+	}
+	return out
+}
+
+func presentationPageNumber(item schema.ChunkDoc) (int, bool) {
+	if raw, ok := item.Extra["slide_number"]; ok {
+		var value any
+		if json.Unmarshal(raw, &value) == nil {
+			switch number := value.(type) {
+			case float64:
+				if number > 0 {
+					return int(number), true
+				}
+			case string:
+				var page int
+				if _, err := fmt.Sscanf(number, "%d", &page); err == nil && page > 0 {
+					return page, true
+				}
+			}
+		}
+	}
+	if item.PageNumber != nil && *item.PageNumber > 0 {
+		return *item.PageNumber, true
+	}
+	return 0, false
+}
+
+func isPDFPresentation(upstream schema.ChunkerFromUpstream) bool {
+	fileType := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(upstream.FileType)), ".")
+	return fileType == "pdf" || strings.HasSuffix(strings.ToLower(upstream.Name), ".pdf")
 }
 
 func init() {

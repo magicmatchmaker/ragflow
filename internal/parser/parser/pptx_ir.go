@@ -24,6 +24,60 @@ import (
 	"ragflow/internal/entity"
 )
 
+const (
+	presentationEMUPerTwip       = int64(635)
+	defaultPresentationWidthEMU  = int64(12192000)
+	defaultPresentationHeightEMU = int64(6858000)
+)
+
+const (
+	presentationCanvasWidthKey   = "slide_canvas_width_emu"
+	presentationCanvasHeightKey  = "slide_canvas_height_emu"
+	presentationElementXKey      = "slide_x_emu"
+	presentationElementYKey      = "slide_y_emu"
+	presentationElementWidthKey  = "slide_element_width_emu"
+	presentationElementHeightKey = "slide_element_height_emu"
+)
+
+type presentationGeometry struct {
+	x, y, width, height int64
+}
+
+func (g presentationGeometry) valid() bool { return g.width > 0 && g.height > 0 }
+
+func (g presentationGeometry) apply(item map[string]any) {
+	if !g.valid() {
+		return
+	}
+	item[presentationElementXKey] = g.x
+	item[presentationElementYKey] = g.y
+	item[presentationElementWidthKey] = g.width
+	item[presentationElementHeightKey] = g.height
+}
+
+func presentationElementGeometry(el docxIRElement, inherited presentationGeometry) presentationGeometry {
+	geometry := inherited
+	if el.WidthEMU > 0 && el.HeightEMU > 0 {
+		geometry = presentationGeometry{x: el.XEMU, y: el.YEMU, width: el.WidthEMU, height: el.HeightEMU}
+	}
+	if el.Type == "image" && el.DisplayWidthEMU > 0 && el.DisplayHeightEMU > 0 {
+		if !geometry.valid() {
+			geometry.x, geometry.y = el.XEMU, el.YEMU
+		}
+		geometry.width, geometry.height = el.DisplayWidthEMU, el.DisplayHeightEMU
+	}
+	return geometry
+}
+
+func presentationCanvas(section docxIRSection) (int64, int64) {
+	width := section.PageSetup.WidthTwips * presentationEMUPerTwip
+	height := section.PageSetup.HeightTwips * presentationEMUPerTwip
+	if width <= 0 || height <= 0 {
+		return defaultPresentationWidthEMU, defaultPresentationHeightEMU
+	}
+	return width, height
+}
+
 // buildPPTXJSONSections emits text runs, tables and images in slide order.
 // Every item retains its slide number; a blank slide emits an empty text item.
 // Container elements are traversed recursively so grouped tables remain structured.
@@ -38,19 +92,37 @@ func buildPPTXJSONSections(irJSON string, sink *officeMediaSink) ([]map[string]a
 	for i, sec := range ir.Sections {
 		start := len(items)
 		var lines []string
+		var lineGeometry presentationGeometry
 		flushText := func() {
 			if len(lines) > 0 {
-				items = append(items, map[string]any{"text": strings.Join(lines, "\n"), "doc_type_kwd": "text"})
+				item := map[string]any{"text": strings.Join(lines, "\n"), "doc_type_kwd": "text"}
+				lineGeometry.apply(item)
+				items = append(items, item)
 				lines = nil
+				lineGeometry = presentationGeometry{}
 			}
 		}
+		appendText := func(text string, geometry presentationGeometry) {
+			text = strings.TrimSpace(text)
+			if text == "" {
+				return
+			}
+			if len(lines) > 0 && geometry != lineGeometry {
+				flushText()
+			}
+			if len(lines) == 0 {
+				lineGeometry = geometry
+			}
+			lines = append(lines, text)
+		}
 		tableSequence := 0
-		var emitElements func([]docxIRElement)
-		emitElements = func(elements []docxIRElement) {
+		var emitElements func([]docxIRElement, presentationGeometry)
+		emitElements = func(elements []docxIRElement, inherited presentationGeometry) {
 			for _, el := range elements {
 				if sink != nil && sink.err != nil {
 					return
 				}
+				geometry := presentationElementGeometry(el, inherited)
 				var units []map[string]any
 				switch el.Type {
 				case "table":
@@ -59,16 +131,20 @@ func buildPPTXJSONSections(irJSON string, sink *officeMediaSink) ([]map[string]a
 					}
 					flushText()
 					tableSequence++
+					before := len(items)
 					items = appendOfficeTableSections(items, el, "", fmt.Sprintf("pptx-slide-%d-table-%d", i+1, tableSequence), sink)
+					for _, item := range items[before:] {
+						geometry.apply(item)
+					}
 					continue
 				case "text_box":
-					emitElements(el.contentBlocks())
+					emitElements(el.contentBlocks(), geometry)
 					continue
 				case "list":
 					for _, item := range el.Items {
-						emitElements(item.Content)
+						emitElements(item.Content, geometry)
 						if item.Nested != nil {
-							emitElements([]docxIRElement{{Type: "list", Items: item.Nested.Items}})
+							emitElements([]docxIRElement{{Type: "list", Items: item.Nested.Items}}, geometry)
 						}
 					}
 					continue
@@ -78,27 +154,31 @@ func buildPPTXJSONSections(irJSON string, sink *officeMediaSink) ([]map[string]a
 					units = appendDOCXImageSection(nil, el.Data, sink, nil)
 				default:
 					if text := strings.TrimSpace(docxElementText(el, "\n")); text != "" {
-						lines = append(lines, text)
+						appendText(text, geometry)
 					}
 				}
 				for _, unit := range units {
 					if unit["doc_type_kwd"] == "text" {
-						lines = append(lines, unit["text"].(string))
+						appendText(unit["text"].(string), geometry)
 						continue
 					}
 					flushText()
+					geometry.apply(unit)
 					items = append(items, unit)
 				}
 			}
 		}
-		emitElements(sec.Elements)
+		emitElements(sec.Elements, presentationGeometry{})
 		flushText()
 		if len(items) == start {
 			items = append(items, map[string]any{"text": "", "doc_type_kwd": "text"})
 		}
+		canvasWidth, canvasHeight := presentationCanvas(sec)
 		mediaOrder := 0
 		for _, item := range items[start:] {
 			item["slide_number"] = i + 1
+			item[presentationCanvasWidthKey] = canvasWidth
+			item[presentationCanvasHeightKey] = canvasHeight
 			if item["doc_type_kwd"] == "image" {
 				mediaOrder++
 				item["media_order"] = mediaOrder
