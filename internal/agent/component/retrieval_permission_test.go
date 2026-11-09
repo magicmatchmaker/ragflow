@@ -3,9 +3,12 @@ package component
 import (
 	"errors"
 	"net/url"
+	"reflect"
+	"strings"
 	"testing"
 
 	"ragflow/internal/agent/runtime"
+	agenttool "ragflow/internal/agent/tool"
 	"ragflow/internal/entity"
 	"ragflow/internal/permission"
 	"ragflow/internal/permission/testsupport"
@@ -104,4 +107,80 @@ func TestCheckCanvasRetrievalDependencies(t *testing.T) {
 	if err := checkCanvasRetrievalDependencies(runtime.WithState(t.Context(), missingCanvasState), db, nil); !errors.Is(err, permission.ErrInvalidPermission) {
 		t.Fatalf("check missing canvas identity error = %v, want invalid permission", err)
 	}
+
+	t.Run("dynamic dataset id resolves before permission and retrieval", func(t *testing.T) {
+		previous := agenttool.GetRetrievalService()
+		recorder := &retrievalRequestRecorder{}
+		agenttool.SetRetrievalService(recorder)
+		t.Cleanup(func() { agenttool.SetRetrievalService(previous) })
+
+		state.SetVar("begin", "site_dataset_id", dataset.ID)
+		component, err := newRetrievalComponent(map[string]any{
+			"dataset_ids":    []any{"begin@site_dataset_id"},
+			"retrieval_from": "dataset",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		if _, err := component.Invoke(ctx, db, map[string]any{"query": "manual"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if got := recorder.request.DatasetIDs; !reflect.DeepEqual(got, []string{dataset.ID}) {
+			t.Fatalf("retrieval dataset IDs = %#v, want %#v", got, []string{dataset.ID})
+		}
+	})
+
+	t.Run("dynamic memory id resolves before permission and retrieval", func(t *testing.T) {
+		previous := agenttool.GetMemoryRetrievalService()
+		recorder := &retrievalRequestRecorder{}
+		agenttool.SetMemoryRetrievalService(recorder)
+		t.Cleanup(func() { agenttool.SetMemoryRetrievalService(previous) })
+
+		state.SetVar("begin", "common_memory_id", sharedMemory.ID)
+		component, err := newRetrievalComponent(map[string]any{
+			"memory_ids":     []any{"begin@common_memory_id"},
+			"retrieval_from": "memory",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		if _, err := component.Invoke(ctx, db, map[string]any{"query": "history"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if got := recorder.request.MemoryIDs; !reflect.DeepEqual(got, []string{sharedMemory.ID}) {
+			t.Fatalf("retrieval memory IDs = %#v, want %#v", got, []string{sharedMemory.ID})
+		}
+	})
+
+	t.Run("missing dynamic id fails before permission check", func(t *testing.T) {
+		component, err := newRetrievalComponent(map[string]any{
+			"dataset_ids":    []any{"begin@missing_dataset_id"},
+			"retrieval_from": "dataset",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		_, err = component.Invoke(ctx, db, map[string]any{"query": "manual"})
+		if err == nil || !strings.Contains(err.Error(), `dataset_ids variable "begin@missing_dataset_id" is empty`) {
+			t.Fatalf("Invoke error = %v, want missing dynamic dataset variable", err)
+		}
+	})
+
+	t.Run("resolved dynamic id still requires permission", func(t *testing.T) {
+		state.SetVar("begin", "private_dataset_id", privateDataset.ID)
+		component, err := newRetrievalComponent(map[string]any{
+			"dataset_ids":    []any{"begin@private_dataset_id"},
+			"retrieval_from": "dataset",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		_, err = component.Invoke(ctx, db, map[string]any{"query": "private"})
+		if !errors.Is(err, permission.ErrPermissionDenied) {
+			t.Fatalf("Invoke error = %v, want permission denied", err)
+		}
+		if !strings.Contains(err.Error(), privateDataset.ID) || strings.Contains(err.Error(), "begin@private_dataset_id") {
+			t.Fatalf("Invoke error = %v, want permission check against resolved dataset %q", err, privateDataset.ID)
+		}
+	})
 }

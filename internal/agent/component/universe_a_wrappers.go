@@ -199,6 +199,9 @@ func (c *retrievalComponent) Outputs() map[string]string {
 func (c *retrievalComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	merged := c.applyDefaults(inputs)
 	normalizeLegacyRetrievalInputs(ctx, db, merged)
+	if err := resolveCanvasRetrievalResourceIDs(ctx, merged); err != nil {
+		return nil, fmt.Errorf("agent Retrieval dependency resolution: %w", err)
+	}
 	if err := checkCanvasRetrievalDependencies(ctx, db, merged); err != nil {
 		return nil, fmt.Errorf("agent Retrieval dependency permission: %w", err)
 	}
@@ -239,6 +242,92 @@ func (c *retrievalComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 
 	return normalizeRetrievalOutputs(parseToolEnvelope(out)), nil
 
+}
+
+// resolveCanvasRetrievalResourceIDs replaces dynamic dataset and memory
+// references with their runtime values before dependency authorization. The
+// resolved IDs remain in inputs, so the permission check and retrieval tool
+// operate on exactly the same resources.
+func resolveCanvasRetrievalResourceIDs(ctx context.Context, inputs map[string]any) error {
+	for _, key := range []string{"dataset_ids", "memory_ids"} {
+		raw, ok := inputs[key]
+		if !ok {
+			continue
+		}
+		resolved, err := resolveCanvasRetrievalResourceIDList(ctx, key, toStringSlice(raw))
+		if err != nil {
+			return err
+		}
+		inputs[key] = resolved
+	}
+	return nil
+}
+
+func resolveCanvasRetrievalResourceIDList(ctx context.Context, key string, ids []string) ([]string, error) {
+	resolved := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		ref, dynamic := canvasResourceIDReference(id)
+		if !dynamic {
+			resolved = append(resolved, id)
+			continue
+		}
+
+		state, err := runtime.GetStateFromContext(ctx)
+		if err != nil || state == nil {
+			return nil, fmt.Errorf("%s variable %q requires canvas runtime state", key, ref)
+		}
+		value, err := state.GetVar(ref)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s variable %q: %w", key, ref, err)
+		}
+		if value == nil {
+			return nil, fmt.Errorf("%s variable %q is empty", key, ref)
+		}
+		before := len(resolved)
+		switch typed := value.(type) {
+		case string:
+			if value := strings.TrimSpace(typed); value != "" {
+				resolved = append(resolved, value)
+			}
+		case []string:
+			for _, value := range typed {
+				if value = strings.TrimSpace(value); value != "" {
+					resolved = append(resolved, value)
+				}
+			}
+		case []any:
+			for _, item := range typed {
+				value, ok := item.(string)
+				if !ok {
+					return nil, fmt.Errorf("%s variable %q contains non-string value", key, ref)
+				}
+				if value = strings.TrimSpace(value); value != "" {
+					resolved = append(resolved, value)
+				}
+			}
+		default:
+			return nil, fmt.Errorf("%s variable %q must be a string or string list", key, ref)
+		}
+		if len(resolved) == before {
+			return nil, fmt.Errorf("%s variable %q is empty", key, ref)
+		}
+	}
+	return resolved, nil
+}
+
+func canvasResourceIDReference(value string) (string, bool) {
+	refs := runtime.ExtractRefs(value)
+	if len(refs) == 1 && strings.Trim(value, "{} \t\r\n") == refs[0] {
+		return refs[0], true
+	}
+	if strings.Contains(value, "@") {
+		return value, true
+	}
+	return "", false
 }
 
 func checkCanvasRetrievalDependencies(ctx context.Context, db *gorm.DB, inputs map[string]any) error {
