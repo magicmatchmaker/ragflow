@@ -547,11 +547,10 @@ func citationGroundingHasSubstantiveText(s string) bool {
 // the model to insert [ID:N] tags into the assistant's final
 // content.
 //
-// Streams grounded deltas when the invoker supports streaming. Returns the
-// original content when no chunks are available or the call fails before
-// emitting anything. Marker-only grounding responses fall back to the
-// original answer; if invalid deltas were already streamed, an error is
-// returned so the caller does not append the first-pass text afterward.
+// Buffers grounded deltas when the invoker supports streaming, then emits the
+// complete grounded answer once after it is known to contain substantive text.
+// Marker-only responses never reach the client and fall back to the original
+// first-pass answer.
 func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, content string, chunks []prompts.CitationSource) (string, error) {
 	if !p.Cite {
 		return content, nil
@@ -577,27 +576,11 @@ func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, cont
 	}
 	var resp *ChatInvokeResponse
 	var err error
-	emittedVisible := false
-	var leadingWhitespace strings.Builder
-	emitting := false
-	emitContent := func(text string) error {
-		if text == "" {
-			return nil
-		}
-		if !emitting {
-			leadingWhitespace.WriteString(text)
-			if strings.TrimSpace(leadingWhitespace.String()) == "" {
-				return nil
-			}
-			text = leadingWhitespace.String()
-			emitting = true
-		}
-		emittedVisible = true
-		runtime.EmitAgentMessage(ctx, text, "")
-		return nil
-	}
+	var streamedGrounded string
+	receivedAnswerDelta := false
 	if streamer, ok := inv.(chat.StreamingInvoker); ok {
 		streamFilter := newCitationMarkerStreamFilter(ids)
+		var streamed strings.Builder
 		resp, err = streamer.Stream(ctx, db, req, func(delta string, isThink bool) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -611,12 +594,13 @@ func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, cont
 			if len(p.OutputStructure) > 0 {
 				return nil
 			}
-			return emitContent(streamFilter.Push(delta))
+			receivedAnswerDelta = true
+			streamed.WriteString(streamFilter.Push(delta))
+			return nil
 		})
 		if err == nil {
-			if flushErr := emitContent(streamFilter.Flush()); flushErr != nil {
-				err = flushErr
-			}
+			streamed.WriteString(streamFilter.Flush())
+			streamedGrounded = streamed.String()
 		}
 	} else {
 		resp, err = inv.Invoke(ctx, db, req)
@@ -631,18 +615,24 @@ func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, cont
 		return content, fmt.Errorf("citation grounding returned no response")
 	}
 	grounded := filterCitationMarkers(resp.Content, ids)
+	if receivedAnswerDelta {
+		// Use exactly the buffered, incrementally filtered body for both the
+		// saved output and the eventual single emission. The production stream
+		// response assembles the same deltas, while this also keeps custom
+		// invokers from returning a body that differs from what they streamed.
+		grounded = streamedGrounded
+	}
 	if strings.TrimSpace(grounded) == "" {
 		return content, nil
 	}
 	// Marker-only grounding must not silently replace the first-pass answer
-	// (#20613). Non-stream (or stream that never emitted) can fall back.
-	// Once invalid deltas have already been streamed, surface an error so the
-	// caller does not append the original answer after the bad markers.
+	// (#20613). Streaming output is held until this check, so the caller can
+	// safely emit the complete first-pass answer without leaking markers.
 	if !citationGroundingHasSubstantiveText(grounded) {
-		if emittedVisible {
-			return content, fmt.Errorf("citation grounding returned markers without answer text")
-		}
 		return content, nil
+	}
+	if len(p.OutputStructure) == 0 {
+		runtime.EmitAgentMessage(ctx, grounded, "")
 	}
 	return grounded, nil
 }
@@ -1143,8 +1133,9 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 	// the canvas state has recorded retrieval chunks (populated
 	// by the Retrieval tool during the ReAct loop), make a second
 	// LLM call to insert [ID:N] tags into the final content. The
-	// grounding call is best-effort until it emits a visible delta. An
-	// interrupted citation stream must not be followed by the first answer.
+	// grounding call is best-effort. Its stream is buffered until the complete
+	// answer is validated, so an invalid result can safely fall back to this
+	// first-pass answer without leaking partial citation output.
 	// Diagnostic sentinel (temporary — see plan): log the post-
 	// agentRunner state right before the `msg.Content` deref so a
 	// subsequent panic shows whether the agent returned (nil, nil).
