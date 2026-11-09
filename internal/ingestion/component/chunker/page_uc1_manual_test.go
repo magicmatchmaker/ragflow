@@ -7,19 +7,24 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"image/png"
 	"os"
 	"testing"
 	"unicode"
 
+	nativeanalyzer "ragflow/internal/deepdoc/parser/pdf/inference/native_analyzer"
+	deepdoctype "ragflow/internal/deepdoc/parser/type"
 	"ragflow/internal/entity"
 	"ragflow/internal/ingestion/component"
 	"ragflow/internal/ingestion/component/schema"
 	"ragflow/internal/parser/media"
 	"ragflow/internal/parser/parser"
+	"ragflow/internal/storage"
 )
 
 const uc1SourceSHA256 = "049be6d8626e7acecf17b5c536797b9f373b7d53ffe6909aa3ac3dbf5663d1d0"
+const uc1PDFSourceSHA256 = "be77dc6d2452c3b025b08ecd2ec99d99a0281e10e7dd0bcad9c267c4978cdf15"
 
 // These are SHA-256 digests of three approved, non-secret representative
 // search markers after letters-and-digits normalization. Keeping only digests
@@ -29,6 +34,13 @@ var uc1SearchMarkerSHA256 = [...]string{
 	"91da14f4f9d1088f4e61afb12a245f8a82319d75f09c20333a2988cc92912f7c",
 	"fe6acd37dd2c479157cc39847dc48b220e6fa5b2c1bc11b220e8693244213d16",
 	"e2e1efb2ea75dbd41cb4d000a83fa7df44e52169b0618298e31bbe9330e1e97e",
+}
+
+// Digests of two approved numeric markers visible inside one rasterized PDF
+// page. The raw values intentionally stay out of source and test output.
+var uc1PDFOCRMarkerSHA256 = [...]string{
+	"8d284220975da66c6cba4a32aaedfa0b897187d86ed9f7a2419c9bd10a103505",
+	"888df25ae35772424a560c7152a1de794440e0ea5cfee62828333a456a506e05",
 }
 
 type presentationManualCache struct {
@@ -154,4 +166,100 @@ func TestUC1PresentationRegression(t *testing.T) {
 	}
 	t.Logf("UC1 regression verified: source_sha256=%s slides=%d image_items=%d distinct_images=%d preview_set_sha256=%s",
 		uc1SourceSHA256, len(chunks), imageItems, len(distinctSourceImages), hex.EncodeToString(previewHash.Sum(nil)))
+}
+
+// TestUC1PDFPresentationRegression exercises the production PDF parser and
+// PageChunker against the approved 52-page conversion. It logs only counts and
+// hashes; document text and the source filename never enter test output.
+func TestUC1PDFPresentationRegression(t *testing.T) {
+	path, modelDir := os.Getenv("RAGFLOW_UC1_PDF_PATH"), os.Getenv("MODEL_DIR")
+	if path == "" || modelDir == "" {
+		t.Skip("RAGFLOW_UC1_PDF_PATH and MODEL_DIR are required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceSum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sourceSum[:]); got != uc1PDFSourceSHA256 {
+		t.Fatalf("source digest = %s, want approved UC1 PDF digest", got)
+	}
+
+	previousAnalyzer := deepdoctype.NativeDocAnalyzerFactory
+	t.Cleanup(func() { deepdoctype.SetNativeDocAnalyzerFactory(previousAnalyzer) })
+	if err := nativeanalyzer.Register(modelDir, nativeanalyzer.DefaultDropScore); err != nil {
+		t.Fatal(err)
+	}
+	parsed := parser.NewPDFParser().ParseWithResult(t.Context(), "uc1-regression.pdf", data)
+	if parsed.Err != nil {
+		t.Fatal(parsed.Err)
+	}
+
+	store := storage.NewMemoryStorage()
+	if err := store.Put(t.Context(), "uc1-pdf-test", "source.pdf", data); err != nil {
+		t.Fatal(err)
+	}
+	previousStorage := component.SetStorageFactoryOverride
+	component.SetStorageFactoryOverride = func() storage.Storage { return store }
+	t.Cleanup(func() { component.SetStorageFactoryOverride = previousStorage })
+
+	cache := &presentationManualCache{}
+	ctx := media.WithCache(t.Context(), cache)
+	pageChunker, err := NewPageChunker(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := pageChunker.Invoke(ctx, nil, map[string]any{
+		"name":          "uc1-regression.pdf",
+		"file_type":     "pdf",
+		"output_format": "json",
+		"json":          parsed.JSON,
+		"file":          parsed.File,
+		"bucket":        "uc1-pdf-test",
+		"path":          "source.pdf",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, ok := schema.ChunkCarrierToMaps(out["chunks"])
+	if !ok || len(chunks) != 52 {
+		t.Fatalf("PDF page chunks = %d, want 52", len(chunks))
+	}
+
+	previewHash := sha256.New()
+	for pageIndex, chunk := range chunks {
+		for _, key := range []string{"positions", "_pdf_positions"} {
+			encoded, err := json.Marshal(chunk[key])
+			if err != nil {
+				t.Fatalf("page %d %s encode: %v", pageIndex+1, key, err)
+			}
+			var rows [][]float64
+			if err := json.Unmarshal(encoded, &rows); err != nil || len(rows) == 0 {
+				t.Fatalf("page %d %s missing or invalid", pageIndex+1, key)
+			}
+			for _, row := range rows {
+				if len(row) != 5 || row[0] != float64(pageIndex) {
+					t.Fatalf("page %d %s has noncanonical page index", pageIndex+1, key)
+				}
+			}
+		}
+		preview, _, err := component.ResolveMediaRef(ctx, chunk)
+		if err != nil {
+			t.Fatalf("page %d preview resolve: %v", pageIndex+1, err)
+		}
+		if _, err := png.Decode(bytes.NewReader(preview)); err != nil {
+			t.Fatalf("page %d preview PNG: %v", pageIndex+1, err)
+		}
+		previewHash.Write(preview)
+	}
+
+	const approvedOCRPageIndex = 28
+	pageText, _ := chunks[approvedOCRPageIndex]["text"].(string)
+	for markerIndex, markerDigest := range uc1PDFOCRMarkerSHA256 {
+		if !containsUC1SearchMarker(pageText, markerDigest) {
+			t.Fatalf("approved OCR marker %d is absent from its PDF page chunk", markerIndex+1)
+		}
+	}
+	t.Logf("UC1 PDF regression verified: source_sha256=%s pages=%d previews=%d preview_set_sha256=%s",
+		uc1PDFSourceSHA256, len(chunks), len(chunks), hex.EncodeToString(previewHash.Sum(nil)))
 }
