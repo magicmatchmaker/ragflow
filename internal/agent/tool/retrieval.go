@@ -51,6 +51,7 @@ type retrievalArgs struct {
 	Query                    string         `json:"query"`
 	DatasetIDs               []string       `json:"dataset_ids,omitempty"`
 	KBIDs                    []string       `json:"kb_ids,omitempty"`
+	DocumentIDs              []string       `json:"document_ids,omitempty"`
 	MemoryIDs                []string       `json:"memory_ids,omitempty"`
 	UserID                   string         `json:"user_id,omitempty"`
 	TopN                     int            `json:"top_n,omitempty"`
@@ -70,6 +71,10 @@ type retrievalArgs struct {
 	// Description is the agent-visible tool description from the DSL. It is
 	// not exposed to the model as part of the tool arguments.
 	Description string `json:"-"`
+	// DocumentIDsSet distinguishes an omitted document_ids key (legacy
+	// dataset-wide search) from an explicitly empty list (fail-closed, no
+	// search). JSON slices alone cannot preserve that distinction.
+	DocumentIDsSet bool `json:"-"`
 }
 
 // retrievalResult is the JSON shape returned to the model. The `_ERROR`
@@ -115,6 +120,9 @@ func NewRetrievalToolWithDefaults(defaults retrievalArgs) *RetrievalTool {
 	if len(defaults.DatasetIDs) == 0 && len(defaults.KBIDs) != 0 {
 		defaults.DatasetIDs = append([]string(nil), defaults.KBIDs...)
 	}
+	if len(defaults.DocumentIDs) != 0 {
+		defaults.DocumentIDsSet = true
+	}
 	name := defaults.FunctionName
 	if strings.TrimSpace(name) == "" {
 		name = retrievalToolName
@@ -152,6 +160,11 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
 			return "", fmt.Errorf("retrieval: parse arguments: %w", err)
 		}
+		var rawArgs map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(argumentsInJSON), &rawArgs); err != nil {
+			return "", fmt.Errorf("retrieval: parse argument keys: %w", err)
+		}
+		_, args.DocumentIDsSet = rawArgs["document_ids"]
 	}
 	args = r.mergeDefaults(args)
 	resolvedQuery, err := resolveRetrievalQuery(ctx, args.Query)
@@ -167,6 +180,7 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	common.Debug("agent retrieval tool: parsed arguments",
 		zap.String("query", args.Query),
 		zap.Strings("dataset_ids", args.DatasetIDs),
+		zap.Strings("document_ids", args.DocumentIDs),
 		zap.Int("top_n", args.TopN),
 		zap.Int("top_k", args.TopK),
 		zap.Float64p("keywords_similarity_weight", args.KeywordsSimilarityWeight),
@@ -193,11 +207,24 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	if args.RetrievalFrom == "memory" && len(args.MemoryIDs) == 0 {
 		return "", fmt.Errorf("retrieval: memory_ids is required")
 	}
+	if args.RetrievalFrom == "dataset" && args.DocumentIDsSet && len(args.DocumentIDs) == 0 {
+		return stubJSONWithErr(retrievalResult{FormalizedContent: args.EmptyResponse})
+	}
 	resolvedDatasetIDs, err := resolveRetrievalDatasetIDs(ctx, args.DatasetIDs)
 	if err != nil {
 		return "", err
 	}
 	args.DatasetIDs = resolvedDatasetIDs
+	if args.RetrievalFrom == "dataset" {
+		resolvedDocumentIDs, err := resolveRetrievalDocumentIDs(ctx, args.DocumentIDs)
+		if err != nil {
+			return "", err
+		}
+		args.DocumentIDs = resolvedDocumentIDs
+		if args.DocumentIDsSet && len(args.DocumentIDs) == 0 {
+			return stubJSONWithErr(retrievalResult{FormalizedContent: args.EmptyResponse})
+		}
+	}
 	resolvedFilter, err := resolveRetrievalFilter(ctx, args.MetaDataFilter)
 	if err != nil {
 		return "", err
@@ -227,6 +254,7 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		CrossLanguages:           append([]string(nil), args.CrossLanguages...),
 		MetaDataFilter:           cloneStringAnyMap(args.MetaDataFilter),
 		RetrievalFrom:            args.RetrievalFrom,
+		DocScope:                 append([]string(nil), args.DocumentIDs...),
 		UserID:                   args.UserID,
 		TenantID:                 retrievalTenantID(ctx),
 	}
@@ -289,6 +317,10 @@ func (r *RetrievalTool) mergeDefaults(args retrievalArgs) retrievalArgs {
 	}
 	if len(args.MemoryIDs) == 0 && len(r.defaults.MemoryIDs) != 0 {
 		args.MemoryIDs = append([]string(nil), r.defaults.MemoryIDs...)
+	}
+	if !args.DocumentIDsSet && r.defaults.DocumentIDsSet {
+		args.DocumentIDs = append([]string(nil), r.defaults.DocumentIDs...)
+		args.DocumentIDsSet = true
 	}
 	if args.TopN <= 0 {
 		args.TopN = r.defaults.TopN
@@ -405,22 +437,30 @@ func resolveRetrievalUserID(ctx context.Context, userID string) (string, error) 
 }
 
 func resolveRetrievalDatasetIDs(ctx context.Context, datasetIDs []string) ([]string, error) {
+	return resolveRetrievalResourceIDs(ctx, "dataset", datasetIDs)
+}
+
+func resolveRetrievalDocumentIDs(ctx context.Context, documentIDs []string) ([]string, error) {
+	return resolveRetrievalResourceIDs(ctx, "document", documentIDs)
+}
+
+func resolveRetrievalResourceIDs(ctx context.Context, resource string, ids []string) ([]string, error) {
 	state, err := runtime.GetStateFromContext(ctx)
 	if err != nil || state == nil {
-		return compactStrings(datasetIDs), nil
+		return compactStrings(ids), nil
 	}
-	resolved := make([]string, 0, len(datasetIDs))
-	for _, datasetID := range datasetIDs {
-		if !strings.Contains(datasetID, "@") {
-			resolved = append(resolved, datasetID)
+	resolved := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !strings.Contains(id, "@") {
+			resolved = append(resolved, id)
 			continue
 		}
-		value, getErr := state.GetVar(datasetID)
+		value, getErr := state.GetVar(id)
 		if getErr != nil {
-			return nil, fmt.Errorf("retrieval: resolve dataset variable %q: %w", datasetID, getErr)
+			return nil, fmt.Errorf("retrieval: resolve %s variable %q: %w", resource, id, getErr)
 		}
 		if value == nil {
-			return nil, fmt.Errorf("retrieval: dataset variable %q is empty", datasetID)
+			return nil, fmt.Errorf("retrieval: %s variable %q is empty", resource, id)
 		}
 		switch typed := value.(type) {
 		case string:
@@ -431,12 +471,12 @@ func resolveRetrievalDatasetIDs(ctx context.Context, datasetIDs []string) ([]str
 			for _, item := range typed {
 				text, ok := item.(string)
 				if !ok {
-					return nil, fmt.Errorf("retrieval: dataset variable %q contains non-string value", datasetID)
+					return nil, fmt.Errorf("retrieval: %s variable %q contains non-string value", resource, id)
 				}
 				resolved = append(resolved, text)
 			}
 		default:
-			return nil, fmt.Errorf("retrieval: dataset variable %q must be a string or string list", datasetID)
+			return nil, fmt.Errorf("retrieval: %s variable %q must be a string or string list", resource, id)
 		}
 	}
 	return compactStrings(resolved), nil

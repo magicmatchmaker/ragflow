@@ -28,16 +28,19 @@ import (
 
 type retrievalRequestRecorder struct {
 	request agenttool.RetrievalRequest
+	calls   int
 }
 
 func (r *retrievalRequestRecorder) Search(_ context.Context, _ *gorm.DB, request agenttool.RetrievalRequest) ([]agenttool.RetrievalChunk, error) {
 	r.request = request
+	r.calls++
 	return []agenttool.RetrievalChunk{}, nil
 }
 
 func TestRetrievalComponentAppliesAdvancedNodeParams(t *testing.T) {
 	component, err := newRetrievalComponent(map[string]any{
 		"dataset_ids":      []any{"dataset-1"},
+		"document_ids":     []any{"document-1", "document-2"},
 		"memory_ids":       []any{"memory-1", "memory-2"},
 		"cross_languages":  []any{"English", "Chinese", "Spanish"},
 		"use_kg":           true,
@@ -51,6 +54,9 @@ func TestRetrievalComponentAppliesAdvancedNodeParams(t *testing.T) {
 	merged := component.(*retrievalComponent).applyDefaults(nil)
 	if got := merged["memory_ids"]; !reflect.DeepEqual(got, []string{"memory-1", "memory-2"}) {
 		t.Errorf("memory_ids = %#v", got)
+	}
+	if got := merged["document_ids"]; !reflect.DeepEqual(got, []string{"document-1", "document-2"}) {
+		t.Errorf("document_ids = %#v", got)
 	}
 	if got := merged["cross_languages"]; !reflect.DeepEqual(got, []string{"English", "Chinese", "Spanish"}) {
 		t.Errorf("cross_languages = %#v", got)
@@ -74,6 +80,7 @@ func TestRetrievalComponentForwardsAdvancedNodeParams(t *testing.T) {
 
 	component, err := newRetrievalComponent(map[string]any{
 		"dataset_ids":      []any{"dataset-1"},
+		"document_ids":     []any{"document-1", "document-2"},
 		"memory_ids":       []any{"memory-1"},
 		"cross_languages":  []any{"English", "Chinese", "Spanish"},
 		"use_kg":           false,
@@ -89,6 +96,9 @@ func TestRetrievalComponentForwardsAdvancedNodeParams(t *testing.T) {
 	}
 
 	request := recorder.request
+	if !reflect.DeepEqual(request.DocScope, []string{"document-1", "document-2"}) {
+		t.Errorf("DocScope = %#v", request.DocScope)
+	}
 	if !reflect.DeepEqual(request.MemoryIDs, []string{"memory-1"}) {
 		t.Errorf("MemoryIDs = %#v", request.MemoryIDs)
 	}

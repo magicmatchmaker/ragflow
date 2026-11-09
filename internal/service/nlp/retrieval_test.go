@@ -1421,6 +1421,9 @@ func TestSearchDocumentScopeRetriesWithRelaxedHybrid(t *testing.T) {
 	if len(retry.MatchExprs) != 3 {
 		t.Fatalf("retry expressions = %d, want the relaxed hybrid's 3", len(retry.MatchExprs))
 	}
+	if got := fmt.Sprint(retry.Filter["kb_id"]); got != "[kb-1]" {
+		t.Fatalf("retry dataset scope = %s, want [kb-1]", got)
+	}
 	if got := fmt.Sprint(retry.Filter["doc_id"]); got != "[doc-1]" {
 		t.Fatalf("retry document scope = %s, want [doc-1]", got)
 	}

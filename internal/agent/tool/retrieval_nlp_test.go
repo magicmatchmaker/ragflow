@@ -247,6 +247,7 @@ func TestNLPRequestFromRetrieval_ThreadsSearchControls(t *testing.T) {
 	got := nlpRequestFromRetrieval(RetrievalRequest{
 		Query:                    "hi",
 		DatasetIDs:               []string{"kb-1"},
+		DocScope:                 []string{"doc-1"},
 		TopN:                     3,
 		TopK:                     99,
 		KeywordsSimilarityWeight: &keywordWeight,
@@ -265,6 +266,9 @@ func TestNLPRequestFromRetrieval_ThreadsSearchControls(t *testing.T) {
 	}
 	if len(got.KbIDs) != 1 || got.KbIDs[0] != "kb-1" {
 		t.Fatalf("KbIDs=%v want [kb-1]", got.KbIDs)
+	}
+	if len(got.DocIDs) != 1 || got.DocIDs[0] != "doc-1" {
+		t.Fatalf("DocIDs=%v want [doc-1]", got.DocIDs)
 	}
 	if got.Page != 1 || got.PageSize != 3 {
 		t.Fatalf("Page/PageSize=%d/%d want 1/3", got.Page, got.PageSize)

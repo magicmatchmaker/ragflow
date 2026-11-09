@@ -71,6 +71,8 @@ func anySlice(v any) []any {
 type retrievalParams struct {
 	Query                    string
 	KbIDs                    []string
+	DocumentIDs              []string
+	DocumentIDsSet           bool
 	MemoryIDs                []string
 	UserID                   string
 	TopN                     int
@@ -110,6 +112,10 @@ func parseRetrievalParams(params map[string]any) retrievalParams {
 	}
 	if v, ok := params["kb_ids"].([]string); ok {
 		out.KbIDs = append(out.KbIDs, v...)
+	}
+	if ids, ok := params["document_ids"]; ok {
+		out.DocumentIDs = toStringSlice(ids)
+		out.DocumentIDsSet = true
 	}
 	out.MemoryIDs = toStringSlice(params["memory_ids"])
 	if v, ok := params["user_id"].(string); ok {
@@ -172,10 +178,11 @@ func (c *retrievalComponent) Name() string { return "Retrieval" }
 
 func (c *retrievalComponent) Inputs() map[string]string {
 	return map[string]string{
-		"query":       "Natural-language search query.",
-		"dataset_ids": "Optional list of dataset IDs to restrict the search to (overrides node-level kb_ids).",
-		"top_n":       "Maximum chunks to return (default 8, overrides node-level top_n).",
-		"use_kg":      "GraphRAG toggle (returns ErrKGRetrievalServiceMissing until a kg adapter is registered).",
+		"query":        "Natural-language search query.",
+		"dataset_ids":  "Optional list of dataset IDs to restrict the search to (overrides node-level kb_ids).",
+		"document_ids": "Optional list of document IDs to restrict the search to. A present empty list returns no results.",
+		"top_n":        "Maximum chunks to return (default 8, overrides node-level top_n).",
+		"use_kg":       "GraphRAG toggle (returns ErrKGRetrievalServiceMissing until a kg adapter is registered).",
 	}
 }
 
@@ -204,6 +211,16 @@ func (c *retrievalComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 	}
 	if err := checkCanvasRetrievalDependencies(ctx, db, merged); err != nil {
 		return nil, fmt.Errorf("agent Retrieval dependency permission: %w", err)
+	}
+	// An explicitly configured document scope is authoritative. In particular,
+	// a Begin variable that resolves to [] means "this site has no documents",
+	// not "remove the filter and search the entire dataset". Keep the legacy
+	// dataset-wide behavior only when document_ids is absent altogether.
+	retrievalFrom, _ := merged["retrieval_from"].(string)
+	if rawDocumentIDs, scoped := merged["document_ids"]; retrievalFrom != "memory" && scoped && len(toStringSlice(rawDocumentIDs)) == 0 {
+		return normalizeRetrievalOutputs(map[string]any{
+			"formalized_content": stringParam(merged["empty_response"]),
+		}), nil
 	}
 	query, _ := merged["query"].(string)
 	if state, err := runtime.GetStateFromContext(ctx); err == nil && state != nil {
@@ -244,12 +261,12 @@ func (c *retrievalComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 
 }
 
-// resolveCanvasRetrievalResourceIDs replaces dynamic dataset and memory
+// resolveCanvasRetrievalResourceIDs replaces dynamic dataset, document, and memory
 // references with their runtime values before dependency authorization. The
 // resolved IDs remain in inputs, so the permission check and retrieval tool
 // operate on exactly the same resources.
 func resolveCanvasRetrievalResourceIDs(ctx context.Context, inputs map[string]any) error {
-	for _, key := range []string{"dataset_ids", "memory_ids"} {
+	for _, key := range []string{"dataset_ids", "document_ids", "memory_ids"} {
 		raw, ok := inputs[key]
 		if !ok {
 			continue
@@ -312,7 +329,11 @@ func resolveCanvasRetrievalResourceIDList(ctx context.Context, key string, ids [
 		default:
 			return nil, fmt.Errorf("%s variable %q must be a string or string list", key, ref)
 		}
-		if len(resolved) == before {
+		// Empty document scope is a valid, fail-closed result: it tells the
+		// Retrieval component to return zero chunks so a downstream common
+		// retrieval branch can run. Dataset and memory dependencies retain their
+		// existing non-empty requirement.
+		if len(resolved) == before && key != "document_ids" {
 			return nil, fmt.Errorf("%s variable %q is empty", key, ref)
 		}
 	}
@@ -444,6 +465,9 @@ func (c *retrievalComponent) applyDefaults(inputs map[string]any) map[string]any
 	}
 	if _, ok := out["memory_ids"]; !ok && len(c.params.MemoryIDs) > 0 {
 		out["memory_ids"] = append([]string(nil), c.params.MemoryIDs...)
+	}
+	if _, ok := out["document_ids"]; !ok && c.params.DocumentIDsSet {
+		out["document_ids"] = append([]string(nil), c.params.DocumentIDs...)
 	}
 	if _, ok := out["user_id"]; !ok && c.params.UserID != "" {
 		out["user_id"] = c.params.UserID

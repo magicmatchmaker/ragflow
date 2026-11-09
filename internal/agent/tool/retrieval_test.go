@@ -586,11 +586,64 @@ func TestRetrieval_UsesEmptyResponseWhenSearchHasNoChunks(t *testing.T) {
 	}
 }
 
+func TestRetrieval_ResolvesAndForwardsDocumentScope(t *testing.T) {
+	previous := GetRetrievalService()
+	service := &capturingRetrievalService{}
+	SetRetrievalService(service)
+	t.Cleanup(func() { SetRetrievalService(previous) })
+
+	state := runtime.NewCanvasState("run-document-scope", "session-document-scope")
+	state.SetVar("begin", "site_document_ids", []any{"doc-1", "doc-2"})
+	ctx := runtime.WithState(t.Context(), state)
+
+	retrievalTool := NewRetrievalToolWithDefaults(retrievalArgs{
+		DatasetIDs:    []string{"kb-1"},
+		DocumentIDs:   []string{"begin@site_document_ids"},
+		RetrievalFrom: "dataset",
+	})
+	if _, err := retrievalTool.InvokableRun(ctx, `{"query":"manual"}`); err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if got := service.req.DocScope; len(got) != 2 || got[0] != "doc-1" || got[1] != "doc-2" {
+		t.Fatalf("DocScope = %#v, want [doc-1 doc-2]", got)
+	}
+}
+
+func TestRetrieval_ExplicitEmptyDocumentScopeReturnsNoResultsWithoutSearch(t *testing.T) {
+	previous := GetRetrievalService()
+	service := &capturingRetrievalService{}
+	SetRetrievalService(service)
+	t.Cleanup(func() { SetRetrievalService(previous) })
+
+	retrievalTool := NewRetrievalToolWithDefaults(retrievalArgs{
+		DatasetIDs:     []string{"kb-1"},
+		DocumentIDs:    []string{},
+		DocumentIDsSet: true,
+		RetrievalFrom:  "dataset",
+		EmptyResponse:  "No site documents.",
+	})
+	out, err := retrievalTool.InvokableRun(t.Context(), `{"query":"manual"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if service.calls != 0 {
+		t.Fatalf("retrieval service calls = %d, want 0", service.calls)
+	}
+	var result retrievalResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if result.FormalizedContent != "No site documents." || len(result.Chunks) != 0 {
+		t.Fatalf("result = %#v, want empty scoped result", result)
+	}
+}
+
 func TestRetrieval_IgnoresCanvasMetadataNodeParams(t *testing.T) {
 	built, err := BuildByName("retrieval", map[string]any{
-		"kb_ids":  []any{"kb-1"},
-		"inputs":  map[string]any{"query": "upstream"},
-		"outputs": map[string]any{"formalized_content": "downstream"},
+		"kb_ids":       []any{"kb-1"},
+		"document_ids": []any{"begin@site_document_ids"},
+		"inputs":       map[string]any{"query": "upstream"},
+		"outputs":      map[string]any{"formalized_content": "downstream"},
 	})
 	if err != nil {
 		t.Fatalf("BuildByName(retrieval): %v", err)
@@ -601,6 +654,9 @@ func TestRetrieval_IgnoresCanvasMetadataNodeParams(t *testing.T) {
 	}
 	if len(rt.defaults.DatasetIDs) != 1 || rt.defaults.DatasetIDs[0] != "kb-1" {
 		t.Fatalf("defaults.DatasetIDs=%#v want [kb-1]", rt.defaults.DatasetIDs)
+	}
+	if !rt.defaults.DocumentIDsSet || len(rt.defaults.DocumentIDs) != 1 || rt.defaults.DocumentIDs[0] != "begin@site_document_ids" {
+		t.Fatalf("defaults document scope = %#v (set=%v), want [begin@site_document_ids]", rt.defaults.DocumentIDs, rt.defaults.DocumentIDsSet)
 	}
 }
 
@@ -671,11 +727,13 @@ func TestRetrieval_RecordsFrontendReferencePayload(t *testing.T) {
 }
 
 type capturingRetrievalService struct {
-	req RetrievalRequest
+	req   RetrievalRequest
+	calls int
 }
 
 func (s *capturingRetrievalService) Search(_ context.Context, _ *gorm.DB, req RetrievalRequest) ([]RetrievalChunk, error) {
 	s.req = req
+	s.calls++
 	return []RetrievalChunk{{ID: "ck-1", Content: "answer"}}, nil
 }
 

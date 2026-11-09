@@ -152,6 +152,56 @@ func TestCheckCanvasRetrievalDependencies(t *testing.T) {
 		}
 	})
 
+	t.Run("dynamic document ids resolve into the retrieval document scope", func(t *testing.T) {
+		previous := agenttool.GetRetrievalService()
+		recorder := &retrievalRequestRecorder{}
+		agenttool.SetRetrievalService(recorder)
+		t.Cleanup(func() { agenttool.SetRetrievalService(previous) })
+
+		state.SetVar("begin", "site_document_ids", []string{"document-1", "document-2"})
+		component, err := newRetrievalComponent(map[string]any{
+			"dataset_ids":    []any{dataset.ID},
+			"document_ids":   []any{"begin@site_document_ids"},
+			"retrieval_from": "dataset",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		if _, err := component.Invoke(ctx, db, map[string]any{"query": "manual"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if got := recorder.request.DocScope; !reflect.DeepEqual(got, []string{"document-1", "document-2"}) {
+			t.Fatalf("retrieval document scope = %#v, want [document-1 document-2]", got)
+		}
+	})
+
+	t.Run("explicit empty dynamic document ids return zero results without searching", func(t *testing.T) {
+		previous := agenttool.GetRetrievalService()
+		recorder := &retrievalRequestRecorder{}
+		agenttool.SetRetrievalService(recorder)
+		t.Cleanup(func() { agenttool.SetRetrievalService(previous) })
+
+		state.SetVar("begin", "empty_site_document_ids", []string{})
+		component, err := newRetrievalComponent(map[string]any{
+			"dataset_ids":    []any{dataset.ID},
+			"document_ids":   []any{"begin@empty_site_document_ids"},
+			"retrieval_from": "dataset",
+		})
+		if err != nil {
+			t.Fatalf("newRetrievalComponent: %v", err)
+		}
+		out, err := component.Invoke(ctx, db, map[string]any{"query": "manual"})
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if recorder.calls != 0 {
+			t.Fatalf("retrieval service calls = %d, want 0", recorder.calls)
+		}
+		if chunks, ok := out["json"].([]any); !ok || len(chunks) != 0 {
+			t.Fatalf("json output = %#v, want empty chunk list", out["json"])
+		}
+	})
+
 	t.Run("missing dynamic id fails before permission check", func(t *testing.T) {
 		component, err := newRetrievalComponent(map[string]any{
 			"dataset_ids":    []any{"begin@missing_dataset_id"},

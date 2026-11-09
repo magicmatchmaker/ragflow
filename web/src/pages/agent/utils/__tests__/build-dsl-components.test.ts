@@ -91,3 +91,33 @@ describe('buildDslComponentsByGraph ManualChunker params', () => {
     });
   });
 });
+
+describe('buildDslComponentsByGraph Retrieval document scope', () => {
+  it('preserves dynamic document_ids from graph form in backend components', () => {
+    const retrievalNode = {
+      id: 'Retrieval:Scoped',
+      type: 'retrievalNode',
+      position: { x: 0, y: 0 },
+      data: {
+        label: Operator.Retrieval,
+        name: 'Scoped Retrieval',
+        form: {
+          query: '{sys.query}',
+          dataset_ids: ['begin@site_dataset_id'],
+          document_ids: ['begin@site_document_ids'],
+          retrieval_from: 'dataset',
+        },
+      },
+    } as any;
+
+    const components = buildDslComponentsByGraph(
+      [retrievalNode],
+      [],
+      {},
+    ) as any;
+
+    expect(components['Retrieval:Scoped'].obj.params.document_ids).toEqual([
+      'begin@site_document_ids',
+    ]);
+  });
+});

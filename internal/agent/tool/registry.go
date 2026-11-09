@@ -469,7 +469,7 @@ func buildRetrievalTool(params map[string]any) (einotool.BaseTool, error) {
 	defaults := retrievalArgs{}
 	for key := range params {
 		switch key {
-		case "dataset_ids", "kb_ids", "top_n", "rerank_candidates_count", "top_k", "similarity_threshold",
+		case "dataset_ids", "kb_ids", "document_ids", "top_n", "rerank_candidates_count", "top_k", "similarity_threshold",
 			"keywords_similarity_weight", "use_kg", "rerank_id", "empty_response",
 			"meta_data_filter", "retrieval_from", "memory_ids",
 			"kb_vars", "cross_languages", "function_name", "description", "meta",
@@ -503,6 +503,12 @@ func buildRetrievalTool(params map[string]any) (einotool.BaseTool, error) {
 		return nil, fmt.Errorf("agent tool: retrieval config: %w", err)
 	} else if ok {
 		defaults.MemoryIDs = ids
+	}
+	if ids, ok, err := stringSliceParam(params, "document_ids"); err != nil {
+		return nil, fmt.Errorf("agent tool: retrieval config: %w", err)
+	} else if ok {
+		defaults.DocumentIDs = ids
+		defaults.DocumentIDsSet = true
 	}
 	if v, ok := stringParam(params, "user_id"); ok {
 		defaults.UserID = v
