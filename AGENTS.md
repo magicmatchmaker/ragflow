@@ -3,6 +3,8 @@
 Use this file as the local operating guide for the current codebase. Prefer the code and the current AGENTS.md over any older convention or remembered project shape.
 
 ## Core Stance
+- For every RAGFlow-related feature request, first verify whether the deployed version already provides the capability by inspecting official documentation and the deployed source/configuration. Report the evidence before proposing a custom implementation; do not replace a built-in capability with custom code.
+- Propose custom code or behavior only when the built-in capability cannot satisfy the request. State why, the exact change scope, risks, and rollback. Do not write code, change configuration or datasets, re-embed data, apply changes, or deploy until the owner explicitly approves that proposal.
 - Treat legacy code as liability, not as a compatibility target.
 - Prefer deletion over shims, deprecated branches, wrapper APIs, and dual-track migration notes.
 - If old and new implementations coexist, converge to one path unless an external contract forces compatibility.
