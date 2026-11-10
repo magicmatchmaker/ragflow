@@ -48,6 +48,52 @@ func withAgentRunner(t *testing.T, fn func(context.Context, AgentParam) (*schema
 	t.Cleanup(func() { agentRunner = prev })
 }
 
+func TestRoundLimitedChatModelFinalInstructionStaysAtBeginning(t *testing.T) {
+	t.Run("merge into existing system prompt", func(t *testing.T) {
+		originalSystem := schema.SystemMessage("You are a grounded assistant.")
+		input := []*schema.Message{
+			originalSystem,
+			schema.UserMessage("Find the tab guide."),
+			{Role: schema.Tool, Content: "retrieval evidence"},
+		}
+
+		got := (&roundLimitedChatModel{remaining: 0}).roundInput(input)
+
+		if len(got) != len(input) {
+			t.Fatalf("message count = %d, want %d", len(got), len(input))
+		}
+		if got[0].Role != schema.System || !strings.Contains(got[0].Content, finalToolBudgetPrompt) {
+			t.Fatalf("first message = %#v, want merged system instruction", got[0])
+		}
+		for i, message := range got[1:] {
+			if message.Role == schema.System {
+				t.Fatalf("message %d is a trailing system message", i+1)
+			}
+		}
+		if originalSystem.Content != "You are a grounded assistant." {
+			t.Fatalf("input system prompt was mutated: %q", originalSystem.Content)
+		}
+	})
+
+	t.Run("prepend when no system prompt exists", func(t *testing.T) {
+		input := []*schema.Message{
+			schema.UserMessage("Find the tab guide."),
+			{Role: schema.Tool, Content: "retrieval evidence"},
+		}
+
+		got := (&roundLimitedChatModel{remaining: 0}).roundInput(input)
+
+		if len(got) != len(input)+1 || got[0].Role != schema.System || got[0].Content != finalToolBudgetPrompt {
+			t.Fatalf("messages = %#v, want a leading system instruction", got)
+		}
+		for i, message := range got[1:] {
+			if message.Role == schema.System {
+				t.Fatalf("message %d is a trailing system message", i+1)
+			}
+		}
+	})
+}
+
 func TestAgent_NoToolsReAct(t *testing.T) {
 	var calls int
 	withAgentRunner(t, func(_ context.Context, _ AgentParam) (*schema.Message, error) {

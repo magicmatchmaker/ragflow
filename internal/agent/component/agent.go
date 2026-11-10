@@ -42,6 +42,7 @@ import (
 
 const maxSubAgentDepth = 8
 const defaultAgentDeferredTimeout = 10 * time.Minute
+const finalToolBudgetPrompt = "The configured tool-call budget is exhausted. Do not call any more tools. Produce your final answer using the evidence already collected. State any missing evidence or uncertainty; do not claim that unperformed searches were completed."
 
 // agentProviderLastSegmentSplit takes a composite llm_id and
 // returns (bareModelName, providerName, true) — or ("", "", false)
@@ -311,8 +312,20 @@ func (m *roundLimitedChatModel) roundInput(input []*schema.Message) []*schema.Me
 		return input
 	}
 	final := make([]*schema.Message, 0, len(input)+1)
-	final = append(final, input...)
-	return append(final, schema.SystemMessage("The configured tool-call budget is exhausted. Do not call any more tools. Produce your final answer using the evidence already collected. State any missing evidence or uncertainty; do not claim that unperformed searches were completed."))
+	// OpenAI-compatible Qwen chat templates require every system message to
+	// appear before user/assistant/tool messages. ReAct already prepends the
+	// configured system prompt, so merge the final-round instruction into that
+	// first message instead of appending a second system message after tool
+	// results. Copy the message before changing it so a retry cannot observe a
+	// mutated prompt from the previous attempt.
+	if len(input) > 0 && input[0] != nil && input[0].Role == schema.System {
+		first := *input[0]
+		first.Content = appendPromptText(first.Content, finalToolBudgetPrompt)
+		final = append(final, &first)
+		return append(final, input[1:]...)
+	}
+	final = append(final, schema.SystemMessage(finalToolBudgetPrompt))
+	return append(final, input...)
 }
 
 // scanAllStreamForToolCall consumes the whole model response, then branches
