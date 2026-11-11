@@ -279,7 +279,8 @@ func (c *ParserComponent) Check() error {
 		// vision enhancement. With neither, the item carries no text and the
 		// Tokenizer drops it, so reject the configuration at build time
 		// instead of indexing nothing silently.
-		if !c.enableVisionEnhancement && !imageSetupRunsOCR(img) {
+		method, _ := img["parse_method"].(string)
+		if !c.enableVisionEnhancement && !imageSetupRunsOCR(img) && !isDoclingHybridParseMethod(method) {
 			return errors.New("parser: image has no text source: OCR is off and vision enhancement is disabled")
 		}
 	}
@@ -503,19 +504,28 @@ func (c *ParserComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[st
 		common.Warn(warning)
 		reportParserWarnings(ctx, []string{warning})
 	}
+	useDoclingHybrid := doclingHybridConfigured(fileTypeExt, setups)
 	parsePagesOn := pdfPageProgressSupported(fileTypeExt, setups)
-	enhanceOn := c.enableVisionEnhancement
+	// Docling's picture_description_api runs before HybridChunker and is the
+	// authoritative image-description path for this mode. Do not invoke the
+	// post-parser vision pass a second time.
+	enhanceOn := c.enableVisionEnhancement && !useDoclingHybrid
 	split := progress.NewSplit(parsePagesOn, enhanceOn)
 	pageWin := split.Take(parsePagesOn)
 	visionWin := split.Take(enhanceOn)
 
-	dispatched, handledVision, visionErr := maybeDispatchPDFVision(ctx, db, fileTypeExt, filename, binary, inputs, setups)
-	if visionErr != nil {
-		return nil, visionErr
+	var dispatched parser.ParseResult
+	var handledVision bool
+	var visionErr error
+	if !useDoclingHybrid {
+		dispatched, handledVision, visionErr = maybeDispatchPDFVision(ctx, db, fileTypeExt, filename, binary, inputs, setups)
+		if visionErr != nil {
+			return nil, visionErr
+		}
 	}
 
 	var handledMedia bool
-	if !handledVision {
+	if !useDoclingHybrid && !handledVision {
 		// Video dispatch: IMAGE2TEXT vision chat.
 		// Mirrors Python's _video().
 		dispatched, handledMedia, visionErr = maybeDispatchVideo(ctx, db, fileTypeExt, filename, binary, inputs, setups)
@@ -524,7 +534,7 @@ func (c *ParserComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[st
 		}
 	}
 	var handledImage bool
-	if !handledVision && !handledMedia {
+	if !useDoclingHybrid && !handledVision && !handledMedia {
 		// Image dispatch: OCR with independently controlled VLM enhancement.
 		dispatched, handledImage, visionErr = maybeDispatchImage(ctx, fileParser, db, fileTypeExt, filename, binary, inputs, setups, c.enableVisionEnhancement, c.vision)
 		if visionErr != nil {
@@ -532,7 +542,7 @@ func (c *ParserComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[st
 		}
 	}
 	var handledAudio bool
-	if !handledVision && !handledMedia && !handledImage {
+	if !useDoclingHybrid && !handledVision && !handledMedia && !handledImage {
 		// Audio dispatch: SPEECH2TEXT transcription.
 		// Mirrors Python's rag/app/audio.py:chunk().
 		dispatched, handledAudio, visionErr = maybeDispatchAudio(ctx, db, fileTypeExt, filename, binary, inputs, setups)

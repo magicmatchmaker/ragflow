@@ -36,6 +36,7 @@ package component
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,15 +71,16 @@ import (
 // reference the same identity.
 const componentNameExtractor = schema.ComponentNameExtractor
 
-// defaultExtractorChatTimeout bounds one Extractor LLM call, including
-// retries and backoff. Tag extraction has its own timeout.
-const defaultExtractorChatTimeout = 180 * time.Second
+// A zero default leaves long indexing calls bounded only by task cancellation.
+// Operators may still set EXTRACTOR_CHAT_TIMEOUT to a positive per-attempt
+// budget; this is not a document-level deadline.
+const defaultExtractorChatTimeout time.Duration = 0
 
 // extractorChatTimeout resolves the per-call LLM budget from
 // EXTRACTOR_CHAT_TIMEOUT (seconds), falling back to
 // defaultExtractorChatTimeout on unset/invalid values.
 func extractorChatTimeout() time.Duration {
-	if v := os.Getenv(common.EnvExtractorChatTimeout); v != "" {
+	if v := os.Getenv(common.EnvExtractorChatTimeout); strings.TrimSpace(v) != "" {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 && n <= math.MaxInt64/int64(time.Second) {
 			return time.Duration(n) * time.Second
 		}
@@ -189,6 +191,13 @@ Create a concise and faithful summary of the provided text content.
 - The summary MUST be in the same language as the original text content.
 - Be concise and focus on the main ideas, omitting redundant details.
 - Output summary ONLY.`
+
+	contextualRetrievalPrompt = `You create retrieval context for one document chunk.
+Return one short, factual prefix that situates the chunk within the document.
+Mention only information supported by the supplied document: document/section/topic,
+relevant entities, equipment or process, and why this chunk matters. Preserve model
+numbers, alarms, values, and terminology exactly. Use the same language as the chunk.
+Do not summarize the chunk, answer it, add Markdown, or add facts. Output the prefix only.`
 )
 
 // ExtractorComponent performs LLM-based extraction over a chunk
@@ -213,6 +222,7 @@ type ExtractorComponent struct {
 //	  "keywords":       map[string]any,   — optional auto keywords extraction config
 //	  "questions":      map[string]any,   — optional auto questions extraction config
 //	  "tags":           map[string]any,   — optional auto tags extraction config
+//	  "contextual":     map[string]any,   — optional document-aware retrieval-prefix config
 //	  "summary":        map[string]any,   — optional auto summary extraction config
 //	  "metadata":       map[string]any,   — optional auto metadata extraction config
 //	}
@@ -277,6 +287,18 @@ func NewExtractorComponent(params map[string]any) (runtime.Component, error) {
 		}
 
 		// 4. Summary
+		if contextualRaw, ok := params["contextual"].(map[string]any); ok {
+			if v, ok := contextualRaw["enabled"].(bool); ok {
+				p.Contextual.Enabled = v
+			} else if v, ok := contextualRaw["enabled"]; ok {
+				p.Contextual.Enabled = mapInt(v) == 1
+			}
+			if v, ok := contextualRaw["system_prompt"].(string); ok {
+				p.Contextual.SystemPrompt = v
+			}
+		}
+
+		// 5. Summary
 		if sumRaw, ok := params["summary"].(map[string]any); ok {
 			if v, ok := sumRaw["enabled"].(bool); ok {
 				p.Summary.Enabled = v
@@ -288,7 +310,7 @@ func NewExtractorComponent(params map[string]any) (runtime.Component, error) {
 			}
 		}
 
-		// 5. Metadata
+		// 6. Metadata
 		if metaRaw, ok := params["metadata"].(map[string]any); ok {
 			if v, ok := metaRaw["enabled"].(bool); ok {
 				p.Metadata.Enabled = v
@@ -587,13 +609,19 @@ func (e *einoExtractorChatInvoker) Chat(ctx context.Context, req extractorChatRe
 	wrapper := models.NewEinoChatModel(cm, chatCfg)
 	// Honour ctx cancel up front so the caller's WithTimeout(...)
 	// is observed even when the driver layer doesn't take a ctx.
-	common.Info(fmt.Sprintf("try to chat with message: %v", req.Messages))
+	common.Debug("extractor: dispatching chat request",
+		zap.String("model", modelName),
+		zap.Int("message_count", len(req.Messages)),
+	)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	out, err := wrapper.Generate(ctx, toExtractorEinoMessages(req.Messages))
 	if err != nil {
-		common.Error(fmt.Sprintf("error when chat with message: %v", req.Messages), err)
+		common.Error("extractor: chat request failed", err,
+			zap.String("model", modelName),
+			zap.Int("message_count", len(req.Messages)),
+		)
 		return nil, err
 	}
 	common.Debug(fmt.Sprintf("extractor: chat completed for model %s, response_length=%d", modelName, len(out.Content)))
@@ -665,6 +693,11 @@ type extractorInputs struct {
 	// for chunks it already extracted. nil disables caching: a Redis-less
 	// deployment, or a test that wants every call to reach the model.
 	cache chunkcache.Store
+	// rejectPromptTruncation makes context fitting fail instead of silently
+	// changing a prompt whose shared document prefix is part of the retrieval
+	// contract. Contextual Retrieval sets this; legacy extraction keeps the
+	// existing best-effort fitting behavior.
+	rejectPromptTruncation bool
 }
 
 // resolveInputs overlays per-call inputs on top of the
@@ -780,10 +813,18 @@ func (c *ExtractorComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 		}, nil
 	}
 
+	contextualOn := c.Param.Contextual.Enabled
 	keywordsOn := c.Param.Keywords.Enabled
 	tagsOn := c.Param.Tags.Enabled
 	remainingOn := c.Param.Questions.Enabled || c.Param.Summary.Enabled || c.Param.Metadata.Enabled
-	phaseWindows := progress.NewSplit(keywordsOn, tagsOn, remainingOn)
+	phaseWindows := progress.NewSplit(contextualOn, keywordsOn, tagsOn, remainingOn)
+
+	// Contextual retrieval is an indexing invariant, not optional enrichment:
+	// every non-empty chunk must receive a prefix. Any failed/timed-out call
+	// fails the document instead of silently mixing contextual and raw vectors.
+	if err := c.runContextualRetrieval(ctx, db, in, phaseWindows.Take(contextualOn)); err != nil {
+		return nil, fmt.Errorf("extractor: %w", err)
+	}
 
 	// No node-level wall-clock budget (see the package doc): each LLM call
 	// carries its own budget, and an expired call skips its chunk instead
@@ -820,6 +861,96 @@ func (c *ExtractorComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 		"output_format": "chunks",
 	}, nil
 }
+
+// runContextualRetrieval implements the per-chunk contextual-prefix stage from
+// Anthropic's Contextual Retrieval design. It deliberately stores the enriched
+// search text in summary while leaving ck["text"] byte-for-byte unchanged:
+// Tokenizer already uses summary for BM25 tokens and, with fields=["summary"],
+// for embeddings; indexdoc later deletes summary and persists raw text.
+func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gorm.DB, in extractorInputs, w progress.Window) error {
+	if !c.Param.Contextual.Enabled {
+		return nil
+	}
+	document := contextualDocumentText(in.chunks)
+	if strings.TrimSpace(document) == "" {
+		return errors.New("contextual retrieval: document text is empty")
+	}
+	digest := sha256.Sum256([]byte(document))
+	taskType := fmt.Sprintf("contextual:%x", digest[:12])
+	systemPrompt := strings.TrimSpace(c.Param.Contextual.SystemPrompt)
+	if systemPrompt == "" {
+		systemPrompt = contextualRetrievalPrompt
+	}
+	ctxIn := extractorInputs{
+		llmID:                  in.llmID,
+		modelID:                in.modelID,
+		temperature:            float64Ptr(0),
+		cache:                  in.cache,
+		rejectPromptTruncation: true,
+	}
+	futs := make([]utility.WorkerPoolFuture[extractorJob, struct{}], 0, len(in.chunks))
+	for i, ck := range in.chunks {
+		i, ck := i, ck
+		rawText := extractorChunkText(ck)
+		if strings.TrimSpace(rawText) == "" {
+			continue
+		}
+		if existing, _ := ck["summary"].(string); strings.TrimSpace(existing) != "" {
+			continue
+		}
+		prompt := contextualRetrievalUserPrompt(rawText, document)
+		fn := func() error {
+			prefix, err := c.callTextCached(ctx, db, ctxIn, taskType, systemPrompt, prompt, chunkCacheID(ck))
+			if err != nil {
+				return fmt.Errorf("contextual retrieval chunk %d: %w", i, err)
+			}
+			prefix = strings.TrimSpace(prefix)
+			if prefix == "" {
+				return fmt.Errorf("contextual retrieval chunk %d returned an empty prefix", i)
+			}
+			ck["summary"] = prefix + "\n\n" + rawText
+			return nil
+		}
+		future, err := extractorPool.Submit(ctx, fn)
+		if err != nil {
+			return err
+		}
+		futs = append(futs, future)
+	}
+	if len(futs) == 0 {
+		for _, ck := range in.chunks {
+			if summary, _ := ck["summary"].(string); strings.TrimSpace(summary) != "" {
+				return nil
+			}
+		}
+		return errors.New("contextual retrieval: no searchable chunks")
+	}
+	return awaitFutures(ctx, futs, w)
+}
+
+func contextualDocumentText(chunks []map[string]any) string {
+	parts := make([]string, 0, len(chunks))
+	for _, ck := range chunks {
+		// Docling Hybrid text already carries headings, captions, and native
+		// picture descriptions. It is also the generation content persisted by
+		// indexdoc; raw_text stays in docling_raw_text as source provenance.
+		text := extractorChunkText(ck)
+		if strings.TrimSpace(text) != "" {
+			parts = append(parts, strings.TrimSpace(text))
+		}
+	}
+	return strings.Join(parts, "\n\n---\n\n")
+}
+
+func contextualRetrievalUserPrompt(chunkText, documentText string) string {
+	// The whole-document prefix is byte-identical across every chunk request,
+	// so vLLM can reuse its prefix/KV cache. The target chunk is the final span,
+	// matching Anthropic Contextual Retrieval and making its preservation easy
+	// to verify. Contextual calls reject any fitter truncation in callRaw.
+	return "<document>\n" + documentText + "\n</document>\n\n<chunk>\n" + chunkText + "\n</chunk>"
+}
+
+func float64Ptr(value float64) *float64 { return &value }
 
 // extractorLLMCacheKey builds the cache key for one textual extraction. The
 // chunk id — not the chunk text — carries the chunk's identity: it already
@@ -1381,6 +1512,9 @@ func (c *ExtractorComponent) callRaw(ctx context.Context, db *gorm.DB, in extrac
 	if fitErr != nil {
 		return nil, fitErr
 	}
+	if in.rejectPromptTruncation && !extractorMessagesEqual(msgs, fitted) {
+		return nil, errors.New("extractor: contextual prompt exceeds the model context window; refusing silent document/chunk truncation")
+	}
 	msgs = fitted
 	inv := getExtractorChatInvoker()
 	req := extractorChatRequest{
@@ -1404,7 +1538,11 @@ func (c *ExtractorComponent) callRaw(ctx context.Context, db *gorm.DB, in extrac
 	// hung call burns at most one attempt. The pool jobs map the expiry to
 	// a per-chunk skip; anything else keeps fail-fast semantics.
 	budget := extractorChatTimeout()
-	callCtx, cancel := context.WithTimeout(ctx, budget)
+	callCtx := ctx
+	cancel := func() {}
+	if budget > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, budget)
+	}
 	defer cancel()
 	if err := common.RetryWithBackoff(callCtx, extractorRetryMax, extractorRetryDelay, func() error {
 		r, e := inv.Chat(callCtx, req)
@@ -1419,6 +1557,18 @@ func (c *ExtractorComponent) callRaw(ctx context.Context, db *gorm.DB, in extrac
 		return nil, fmt.Errorf("extractor: chat: nil response from invoker")
 	}
 	return resp, nil
+}
+
+func extractorMessagesEqual(left, right []eschema.Message) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Role != right[i].Role || left[i].Content != right[i].Content {
+			return false
+		}
+	}
+	return true
 }
 
 // toolCallRE matches a <tool_call>...</tool_call> block, mirroring Python's
@@ -1834,8 +1984,9 @@ func fitExtractorMessages(ctx context.Context, db *gorm.DB, llmID string, msgs [
 
 	fitted := make([]eschema.Message, 0, len(kept))
 	for j, i := range keptIdx {
-		msgs[i].Content = kept[j].Content
-		fitted = append(fitted, msgs[i])
+		message := msgs[i]
+		message.Content = kept[j].Content
+		fitted = append(fitted, message)
 	}
 	if len(fitted) == 0 {
 		return nil, errors.New("extractor: message fitting dropped every message; check the chat model context length setting")

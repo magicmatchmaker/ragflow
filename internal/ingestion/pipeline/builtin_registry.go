@@ -15,6 +15,20 @@ import (
 
 const builtinTemplatePrefix = "ingestion_pipeline_"
 
+// isBuiltinCatalogHidden marks operator-only templates that remain valid for
+// direct dataset configuration and runtime execution but must not be offered
+// in the generic UI pipeline picker. docling_contextual depends on deployment-
+// owned Docling/DGX resources and is applied only by the scoped migration
+// helper, so exposing its incomplete editor graph would invite unsafe edits.
+func isBuiltinCatalogHidden(ref string) bool {
+	switch ref {
+	case "docling_contextual":
+		return true
+	default:
+		return false
+	}
+}
+
 // builtinParserOrder matches Python's settings.PARSERS order, projected onto
 // the canonical builtin templates shipped by Go. Templates not in this list
 // are appended deterministically after the shared parser methods.
@@ -161,7 +175,7 @@ func (r *Registry) List() *BuiltinPipelineListResponse {
 	}
 	out := make([]*BuiltinPipelineMeta, 0, len(r.list))
 	for _, item := range r.list {
-		if item == nil {
+		if item == nil || isBuiltinCatalogHidden(item.ParserID) {
 			continue
 		}
 		cp := *item

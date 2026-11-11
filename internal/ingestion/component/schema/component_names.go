@@ -32,3 +32,5 @@ const (
 	ComponentNameTitleChunker   = common.ComponentNameTitleChunker
 	ComponentNameManualChunker  = common.ComponentNameManualChunker
 )
+
+const ComponentNameDoclingHybridChunker = common.ComponentNameDoclingHybridChunker

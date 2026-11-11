@@ -1136,6 +1136,10 @@ var componentParamWhitelistExemptions = map[string]string{
 	"Compiler":       "covered by the cpnID-prefixed dynamic whitelist",
 }
 
+var componentParamWhitelistAdditionalExemptions = map[string]string{
+	"DoclingHybridChunker": "no user-editable params; official HybridChunker owns boundaries upstream",
+}
+
 // TestBuiltinTemplateComponentsHaveWhitelistCoverage pins the component-name
 // inventory of the builtin templates: every name must either derive its param
 // whitelist from a schema (componentParamSchemaKeys) or be exempted above. It
@@ -1172,6 +1176,9 @@ func TestBuiltinTemplateComponentsHaveWhitelistCoverage(t *testing.T) {
 			continue
 		}
 		if _, ok := componentParamWhitelistExemptions[name]; ok {
+			continue
+		}
+		if _, ok := componentParamWhitelistAdditionalExemptions[name]; ok {
 			continue
 		}
 		t.Errorf("component %q (template %q) is neither schema-derived nor exempt: add it to componentParamSchemaKeys or exempt it with a reason", name, ref)

@@ -149,18 +149,18 @@ func TestExtractorChatTimeoutEnv(t *testing.T) {
 		value string
 		want  time.Duration
 	}{
-		{name: "unset falls back to default", value: "", want: defaultExtractorChatTimeout},
+		{name: "unset has no hard timeout", value: "", want: 0},
 		{name: "override wins", value: "1", want: time.Second},
-		{name: "whitespace falls back", value: " \t", want: defaultExtractorChatTimeout},
+		{name: "whitespace has no hard timeout", value: " \t", want: 0},
 		{name: "trimmed override wins", value: " 240 ", want: 240 * time.Second},
-		{name: "duration suffix falls back", value: "180s", want: defaultExtractorChatTimeout},
-		{name: "fractional seconds fall back", value: "1.5", want: defaultExtractorChatTimeout},
+		{name: "duration suffix falls back", value: "180s", want: 0},
+		{name: "fractional seconds fall back", value: "1.5", want: 0},
 		{name: "maximum duration seconds", value: "9223372036", want: 9223372036 * time.Second},
-		{name: "duration overflow falls back", value: "9223372037", want: defaultExtractorChatTimeout},
-		{name: "integer overflow falls back", value: "9223372036854775808", want: defaultExtractorChatTimeout},
-		{name: "zero falls back", value: "0", want: defaultExtractorChatTimeout},
-		{name: "negative falls back", value: "-5", want: defaultExtractorChatTimeout},
-		{name: "non-numeric falls back", value: "abc", want: defaultExtractorChatTimeout},
+		{name: "duration overflow falls back", value: "9223372037", want: 0},
+		{name: "integer overflow falls back", value: "9223372036854775808", want: 0},
+		{name: "zero disables hard timeout", value: "0", want: 0},
+		{name: "negative disables hard timeout", value: "-5", want: 0},
+		{name: "non-numeric disables hard timeout", value: "abc", want: 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(common.EnvExtractorChatTimeout, tt.value)
@@ -169,8 +169,8 @@ func TestExtractorChatTimeoutEnv(t *testing.T) {
 			}
 		})
 	}
-	if defaultExtractorChatTimeout != 180*time.Second {
-		t.Errorf("defaultExtractorChatTimeout = %v, want 180s", defaultExtractorChatTimeout)
+	if defaultExtractorChatTimeout != 0 {
+		t.Errorf("defaultExtractorChatTimeout = %v, want disabled", defaultExtractorChatTimeout)
 	}
 }
 

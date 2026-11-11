@@ -26,6 +26,7 @@ const (
 	ComponentNameManualChunker         = common.ComponentNameManualChunker
 	ComponentNameOneChunker            = common.ComponentNameOneChunker
 	ComponentNamePageChunker           = common.ComponentNamePageChunker
+	ComponentNameDoclingHybridChunker  = common.ComponentNameDoclingHybridChunker
 	ComponentNameQAChunker             = common.ComponentNameQAChunker
 	ComponentNameTableChunker          = common.ComponentNameTableChunker
 	ComponentNameGroupTitleChunker     = common.ComponentNameGroupTitleChunker

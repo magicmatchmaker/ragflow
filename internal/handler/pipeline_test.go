@@ -187,6 +187,9 @@ func TestPipelineHandler_ListPipelines_RealRegistry(t *testing.T) {
 	if seen["naive"] {
 		t.Error("alias naive must be hidden from listing")
 	}
+	if seen["docling_contextual"] {
+		t.Error("operator-only docling_contextual must be hidden from the UI catalog")
+	}
 }
 
 func TestPipelineHandler_GetPipeline(t *testing.T) {

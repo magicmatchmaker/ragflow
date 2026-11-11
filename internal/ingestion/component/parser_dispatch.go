@@ -88,6 +88,13 @@ func dispatchParse(ctx context.Context, p parser.ParseResultProducer, fileType u
 			parseMethod = s
 		}
 	}
+	// Docling Hybrid is a complete parser+chunker backend. Only replace the
+	// native producer for formats this adapter explicitly supports; any other
+	// format keeps its proven native parser and is passed through unchanged by
+	// DoclingHybridChunker downstream.
+	if isDoclingHybridParseMethod(parseMethod) && doclingHybridSupports(fileType) {
+		p = parser.NewDoclingHybridParser(fileType)
+	}
 
 	configureParserFromSetups(p, fileType, setups)
 	attachPDFPageProgress(ctx, p, window)
@@ -105,6 +112,34 @@ func dispatchParse(ctx context.Context, p parser.ParseResultProducer, fileType u
 		res.File["parse_method"] = parseMethod
 	}
 	return res
+}
+
+func doclingHybridConfigured(fileType utility.FileType, setups map[string]schema.ParserSetup) bool {
+	setup, ok := setups[resolveParserFamily(fileType)]
+	if !ok {
+		return false
+	}
+	method, _ := setup["parse_method"].(string)
+	return isDoclingHybridParseMethod(method) && doclingHybridSupports(fileType)
+}
+
+func isDoclingHybridParseMethod(method string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(method)))
+	return normalized == "doclinghybrid"
+}
+
+func doclingHybridSupports(fileType utility.FileType) bool {
+	switch fileType {
+	case utility.FileTypePDF,
+		utility.FileTypeDOCX,
+		utility.FileTypePPTX,
+		utility.FileTypeXLSX,
+		utility.FileTypeCSV,
+		utility.FileTypeVISUAL:
+		return true
+	default:
+		return false
+	}
 }
 
 // pdfPageProgressSupported reports whether the configured parser setup produces

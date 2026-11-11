@@ -16,7 +16,11 @@
 
 package schema
 
-import "ragflow/internal/common"
+import (
+	"errors"
+
+	"ragflow/internal/common"
+)
 
 // TagLabel is a single labeled record from the tag definition file:
 // a piece of content and the tags associated with it.
@@ -107,6 +111,15 @@ type SummaryExtractConfig struct {
 	SystemPrompt string `json:"system_prompt,omitempty"`
 }
 
+// ContextualRetrievalConfig configures Anthropic-style contextual retrieval:
+// one short document-aware prefix is generated per chunk. The Extractor keeps
+// the raw chunk text untouched and places prefix+raw text in the transient
+// Summary channel consumed by Tokenizer for BM25 and embedding.
+type ContextualRetrievalConfig struct {
+	Enabled      bool   `json:"enabled"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+}
+
 // MetadataExtractConfig configures structured metadata extraction.
 // BuiltInMetadata is carried for persistence/replay; it is NOT LLM-extracted.
 // Deterministic file_name/update_time is applied via PipelineResult -> doc_state.applyBuiltInMetadata.
@@ -123,11 +136,12 @@ type ExtractorParam struct {
 	LLMID string `json:"llm_id,omitempty"`
 
 	// Modular sub-configs
-	Keywords  KeywordExtractConfig  `json:"keywords,omitempty"`
-	Questions QuestionExtractConfig `json:"questions,omitempty"`
-	Tags      TagExtractConfig      `json:"tags,omitempty"`
-	Summary   SummaryExtractConfig  `json:"summary,omitempty"`
-	Metadata  MetadataExtractConfig `json:"metadata,omitempty"`
+	Keywords   KeywordExtractConfig      `json:"keywords,omitempty"`
+	Questions  QuestionExtractConfig     `json:"questions,omitempty"`
+	Tags       TagExtractConfig          `json:"tags,omitempty"`
+	Contextual ContextualRetrievalConfig `json:"contextual,omitempty"`
+	Summary    SummaryExtractConfig      `json:"summary,omitempty"`
+	Metadata   MetadataExtractConfig     `json:"metadata,omitempty"`
 }
 
 // Defaults returns the default ExtractorParam.
@@ -137,8 +151,10 @@ func (ExtractorParam) Defaults() ExtractorParam {
 	}
 }
 
-// Validate always returns nil.
 func (p *ExtractorParam) Validate() error {
+	if p.Contextual.Enabled && p.Summary.Enabled {
+		return errors.New("contextual retrieval and summary extraction cannot both write the summary channel")
+	}
 	return nil
 }
 

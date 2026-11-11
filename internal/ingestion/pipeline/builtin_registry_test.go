@@ -199,6 +199,39 @@ func TestRegistryAliasNaiveResolvesGeneral(t *testing.T) {
 	}
 }
 
+func TestDoclingContextualHiddenFromCatalogButRunnable(t *testing.T) {
+	r, err := DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	tpl, ok := r.Get("docling_contextual")
+	if !ok || tpl.ParserID != "docling_contextual" {
+		t.Fatalf("Get(docling_contextual) = (%#v, %v), want runnable template", tpl, ok)
+	}
+	if !r.IsValid("docling_contextual") {
+		t.Fatal("docling_contextual must remain valid for scoped dataset execution")
+	}
+	if dsl, loadErr := LoadBuiltinDSL("docling_contextual"); loadErr != nil || dsl == "" {
+		t.Fatalf("LoadBuiltinDSL(docling_contextual) = %q, %v", dsl, loadErr)
+	}
+	foundRef := false
+	for _, ref := range r.Refs() {
+		foundRef = foundRef || ref == "docling_contextual"
+	}
+	if !foundRef {
+		t.Fatal("Refs() must retain docling_contextual for internal validation")
+	}
+	listed := r.List()
+	for _, meta := range listed.BuiltinPipelines {
+		if meta.ParserID == "docling_contextual" {
+			t.Fatal("operator-only docling_contextual leaked into the UI catalog")
+		}
+	}
+	if listed.Total != int64(len(listed.BuiltinPipelines)) {
+		t.Fatalf("catalog total = %d, len(canvas) = %d", listed.Total, len(listed.BuiltinPipelines))
+	}
+}
+
 // TestLoadBuiltinDSL verifies that valid and aliased parser_ids resolve to
 // real DSL content, and that unknown ids fail.
 func TestLoadBuiltinDSL_Canonical(t *testing.T) {

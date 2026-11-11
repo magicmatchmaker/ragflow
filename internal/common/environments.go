@@ -17,6 +17,7 @@
 package common
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,6 +43,22 @@ func GetEnvInt(key string, def int) int {
 		return def
 	}
 	return v
+}
+
+// GetEnvSecret reads a secret from fileKey when configured, otherwise from
+// valueKey. A configured-but-unreadable file is an error and never falls back
+// to plaintext, so a broken secret mount cannot silently select stale env
+// credentials. Leading/trailing whitespace (including a trailing newline in a
+// Docker/Kubernetes secret file) is removed.
+func GetEnvSecret(valueKey, fileKey string) (string, error) {
+	if path := strings.TrimSpace(GetEnv(fileKey)); path != "" {
+		data, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return "", fmt.Errorf("read secret file from %s: %w", fileKey, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	return strings.TrimSpace(GetEnv(valueKey)), nil
 }
 
 func GetEnvSmall(key string) string {
@@ -529,6 +546,23 @@ const (
 	// web_search is NEVER in scope because its hits carry no corpus document with
 	// a source_chunk_ids linkage.
 	EnvCompiledServeScope = "RAGFLOW_COMPILED_SERVE_SCOPE"
+)
+
+// Docling Hybrid ingestion settings are kept in their own block so additions
+// do not reformat the repository's large legacy environment constant table.
+const (
+	EnvDoclingHybridTokenizer              = "DOCLING_HYBRID_TOKENIZER"
+	EnvDoclingHybridMaxTokens              = "DOCLING_HYBRID_MAX_TOKENS"
+	EnvDoclingRequestTimeout               = "DOCLING_REQUEST_TIMEOUT_SECONDS"
+	EnvDoclingRequestRetryMax              = "DOCLING_REQUEST_RETRY_MAX"
+	EnvDoclingResponseMaxBytes             = "DOCLING_RESPONSE_MAX_BYTES"
+	EnvDoclingPictureDescriptionURL        = "DOCLING_PICTURE_DESCRIPTION_URL"
+	EnvDoclingPictureDescriptionAPIKeyFile = "DOCLING_PICTURE_DESCRIPTION_API_KEY_FILE"
+	EnvDoclingPictureDescriptionModel      = "DOCLING_PICTURE_DESCRIPTION_MODEL"
+	EnvDoclingPictureDescriptionPrompt     = "DOCLING_PICTURE_DESCRIPTION_PROMPT"
+	EnvDoclingPictureDescriptionTimeout    = "DOCLING_PICTURE_DESCRIPTION_TIMEOUT"
+	EnvDoclingPictureDescriptionWorkers    = "DOCLING_PICTURE_DESCRIPTION_CONCURRENCY"
+	EnvDoclingPictureDescriptionArea       = "DOCLING_PICTURE_DESCRIPTION_AREA_THRESHOLD"
 )
 
 // EnvLLMHTTPResponseHeaderTimeout bounds how long an outbound provider call may

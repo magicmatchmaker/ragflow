@@ -30,6 +30,7 @@ const (
 	ComponentNameManualChunker         = "ManualChunker"
 	ComponentNameOneChunker            = "OneChunker"
 	ComponentNamePageChunker           = "PageChunker"
+	ComponentNameDoclingHybridChunker  = "DoclingHybridChunker"
 	ComponentNameQAChunker             = "QAChunker"
 	ComponentNameTableChunker          = "TableChunker"
 	ComponentNameGroupTitleChunker     = "GroupTitleChunker"
@@ -50,6 +51,7 @@ func IsComponentName(name string) bool {
 		ComponentNameManualChunker,
 		ComponentNameOneChunker,
 		ComponentNamePageChunker,
+		ComponentNameDoclingHybridChunker,
 		ComponentNameQAChunker,
 		ComponentNameTableChunker,
 		ComponentNameGroupTitleChunker,

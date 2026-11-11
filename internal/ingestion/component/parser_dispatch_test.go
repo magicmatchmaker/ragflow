@@ -68,6 +68,31 @@ func useMockDocAnalyzer(t *testing.T) {
 	})
 }
 
+func TestDoclingHybridSupportsVerifiedFormatsAndLeavesLegacyBinaryFormatsNative(t *testing.T) {
+	for _, fileType := range []utility.FileType{
+		utility.FileTypePDF,
+		utility.FileTypeDOCX,
+		utility.FileTypePPTX,
+		utility.FileTypeXLSX,
+		utility.FileTypeCSV,
+		utility.FileTypeVISUAL,
+	} {
+		if !doclingHybridSupports(fileType) {
+			t.Errorf("doclingHybridSupports(%q) = false, want true", fileType)
+		}
+	}
+	for _, fileType := range []utility.FileType{
+		utility.FileTypeDOC,
+		utility.FileTypePPT,
+		utility.FileTypeXLS,
+		utility.FileTypeTXT,
+	} {
+		if doclingHybridSupports(fileType) {
+			t.Errorf("doclingHybridSupports(%q) = true, want native fallback", fileType)
+		}
+	}
+}
+
 type captureSetupConfigurer struct {
 	setup map[string]any
 }
