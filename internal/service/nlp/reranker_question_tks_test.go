@@ -167,10 +167,22 @@ func TestRerankByModelWithoutQuestionTks(t *testing.T) {
 	}
 }
 
-// TestRerankByModelPrefersNaturalText pins the reranker input contract: the
-// cross-encoder is scored on content_with_weight (natural text, markup
-// preserved, passed through untouched), never on the tokenized fields.
-func TestRerankByModelPrefersNaturalText(t *testing.T) {
+func TestRerankByModelPrefersContextualTextOverRawContent(t *testing.T) {
+	chunk := fullChunk()
+	chunk[common.ContextualContentField] = "document-aware prefix\n\nraw citation body"
+	chunk["content_with_weight"] = "raw citation body"
+
+	doc := rerankOneChunk(t, chunk)
+
+	if want := chunk[common.ContextualContentField].(string); doc != want {
+		t.Errorf("got %q, want contextual reranker input %q", doc, want)
+	}
+}
+
+// TestRerankByModelFallsBackToRawNaturalText pins the compatibility contract:
+// ordinary and pre-migration chunks have no contextual_with_weight, so the
+// cross-encoder scores content_with_weight with markup preserved.
+func TestRerankByModelFallsBackToRawNaturalText(t *testing.T) {
 	chunk := fullChunk()
 	chunk["content_with_weight"] = "<p>La sécurité des données : voir l'annexe A.</p>"
 
@@ -178,6 +190,16 @@ func TestRerankByModelPrefersNaturalText(t *testing.T) {
 
 	if want := chunk["content_with_weight"].(string); doc != want {
 		t.Errorf("got %q, want %q", doc, want)
+	}
+}
+
+func TestRerankByModelEmptyContextualTextFallsBackToRawContent(t *testing.T) {
+	chunk := fullChunk()
+	chunk[common.ContextualContentField] = " \n "
+	chunk["content_with_weight"] = "raw citation body"
+
+	if doc := rerankOneChunk(t, chunk); doc != "raw citation body" {
+		t.Errorf("got %q, want raw content fallback", doc)
 	}
 }
 

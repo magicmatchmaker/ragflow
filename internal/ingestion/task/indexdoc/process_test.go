@@ -356,6 +356,27 @@ func TestProcessChunksForPipeline_SummaryProcessing(t *testing.T) {
 	}
 }
 
+func TestProcessChunksForPipeline_PreservesContextualContentBesideRawContent(t *testing.T) {
+	const (
+		raw        = "raw chunk used by answers and citations"
+		contextual = "document-aware prefix\n\n" + raw
+	)
+	chunks := []map[string]any{{
+		"text":                        raw,
+		common.ContextualContentField: contextual,
+	}}
+	_, err := ProcessChunksForPipeline(chunks, "doc-1", "test-doc.pdf", time.Now())
+	if err != nil {
+		t.Fatalf("ProcessChunksForPipeline: %v", err)
+	}
+	if got := chunks[0]["content_with_weight"]; got != raw {
+		t.Fatalf("content_with_weight = %#v, want raw content %q", got, raw)
+	}
+	if got := chunks[0][common.ContextualContentField]; got != contextual {
+		t.Fatalf("contextual_with_weight = %#v, want indexed contextual text %q", got, contextual)
+	}
+}
+
 // TestProcessChunksForPipeline_PreservesTokenizerProducedFields documents the
 // Tokenizer-terminated contract: when the upstream Tokenizer already produced
 // the _tks/_ltks/_kwd fields, the executor preserves them untouched and only

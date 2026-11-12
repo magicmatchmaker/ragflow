@@ -85,8 +85,8 @@ func TestDoclingContextualTemplateIsCompleteMigrationSource(t *testing.T) {
 	}
 
 	tokenizer := componentParamsForContract(t, components, "Tokenizer:DoclingContextual")
-	if got := tokenizer["fields"]; got != "summary" {
-		t.Fatalf("Tokenizer fields = %v, want contextual summary channel", got)
+	if got := tokenizer["fields"]; got != "contextual_with_weight" {
+		t.Fatalf("Tokenizer fields = %v, want dedicated contextual content", got)
 	}
 	extractor := componentParamsForContract(t, components, "Extractor:DoclingContextual")
 	contextual, _ := extractor["contextual"].(map[string]any)
@@ -121,8 +121,8 @@ func TestDoclingContextualTemplateIsCompleteMigrationSource(t *testing.T) {
 				t.Errorf("Extractor graph form does not expose contextual=true: %#v", form)
 			}
 		case "Tokenizer:DoclingContextual":
-			if form["fields"] != "summary" {
-				t.Errorf("Tokenizer graph form fields = %#v, want summary", form["fields"])
+			if form["fields"] != "contextual_with_weight" {
+				t.Errorf("Tokenizer graph form fields = %#v, want contextual_with_weight", form["fields"])
 			}
 		}
 	}

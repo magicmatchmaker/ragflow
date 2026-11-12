@@ -129,7 +129,7 @@
                 "obj": {
                     "component_name": "Tokenizer",
                     "params": {
-                        "fields": "summary",
+                        "fields": "contextual_with_weight",
                         "filename_embd_weight": 0.1,
                         "search_method": [
                             "embedding",
@@ -264,7 +264,7 @@
                         "label": "Tokenizer",
                         "name": "2B Contextual Tokenizer",
                         "form": {
-                            "fields": "summary",
+                            "fields": "contextual_with_weight",
                             "filename_embd_weight": 0.1,
                             "search_method": [
                                 "embedding",

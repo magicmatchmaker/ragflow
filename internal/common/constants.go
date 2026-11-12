@@ -17,6 +17,10 @@
 package common
 
 const (
+	// ContextualContentField stores the natural contextual retrieval text
+	// (document-aware prefix + raw chunk) used by embeddings and rerankers.
+	// content_with_weight remains the raw chunk used for answers and citations.
+	ContextualContentField = "contextual_with_weight"
 	// PAGERANK_FLD is the field name for pagerank score
 	PAGERANK_FLD = "pagerank_fea"
 	// TAG_FLD is the field name for tag features

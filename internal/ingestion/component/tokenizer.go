@@ -1042,44 +1042,40 @@ func tokenizeChunks(chunks []schema.ChunkDoc, titleStem string, language string)
 				return fmt.Errorf("tokenizer: keyword tokens marshal: %w", err)
 			}
 		}
-		// Keep Go: skip whitespace-only summaries so they don't shadow
-		// the real Text. Python's truthy check (tokenizer.py:155) treats
-		// "   " as present and blanks out content_ltks; Go is more sensible.
-		if s := strings.TrimSpace(ck.Summary); s != "" {
-			st, err := tok.Tokenize(s)
-			if err != nil {
-				return fmt.Errorf("tokenizer: summary tokenize: %w", err)
-			}
-			if st == "" {
-				st = s
-			}
-			ck.ContentLtks = st
-			smt, err := tok.FineGrainedTokenize(st)
-			if err != nil {
-				return fmt.Errorf("tokenizer: summary fine-grain: %w", err)
-			}
-			if smt == "" {
-				smt = st
-			}
-			ck.ContentSmLtks = smt
-		} else if t := schema.ContextualText(*ck); strings.TrimSpace(t) != "" {
-			tt, err := tok.Tokenize(t)
-			if err != nil {
-				return fmt.Errorf("tokenizer: text tokenize: %w", err)
-			}
-			if tt == "" {
-				tt = t
-			}
-			ck.ContentLtks = tt
-			smt, err := tok.FineGrainedTokenize(tt)
-			if err != nil {
-				return fmt.Errorf("tokenizer: text fine-grain: %w", err)
-			}
-			if smt == "" {
-				smt = tt
-			}
-			ck.ContentSmLtks = smt
+		// Full-text recall and document embeddings must use the same search
+		// text. Contextual retrieval owns the highest-priority natural field;
+		// ordinary summary extraction retains its historical priority over raw
+		// text for non-contextual pipelines. Whitespace-only enrichments never
+		// shadow the real chunk body.
+		searchText := schema.ContextualText(*ck)
+		searchField := "text"
+		if summary := strings.TrimSpace(ck.Summary); summary != "" {
+			searchText = summary
+			searchField = "summary"
 		}
+		if contextual := strings.TrimSpace(ck.ContextualWithWeight); contextual != "" {
+			searchText = contextual
+			searchField = common.ContextualContentField
+		}
+		if strings.TrimSpace(searchText) == "" {
+			continue
+		}
+		contentTokens, err := tok.Tokenize(searchText)
+		if err != nil {
+			return fmt.Errorf("tokenizer: %s tokenize: %w", searchField, err)
+		}
+		if contentTokens == "" {
+			contentTokens = searchText
+		}
+		ck.ContentLtks = contentTokens
+		fineTokens, err := tok.FineGrainedTokenize(contentTokens)
+		if err != nil {
+			return fmt.Errorf("tokenizer: %s fine-grain: %w", searchField, err)
+		}
+		if fineTokens == "" {
+			fineTokens = contentTokens
+		}
+		ck.ContentSmLtks = fineTokens
 	}
 	return nil
 }
@@ -1099,6 +1095,8 @@ func concatFields(ck schema.ChunkDoc, fields []string) string {
 			b.WriteString(ck.Keywords)
 		case "summary":
 			b.WriteString(ck.Summary)
+		case common.ContextualContentField:
+			b.WriteString(ck.ContextualWithWeight)
 		default:
 			if s, ok := ck.GetExtraString(f); ok {
 				b.WriteString(s)
@@ -1147,7 +1145,7 @@ func validateTokenizerOutputs(chunks []schema.ChunkDoc, searchMethods, fields []
 }
 
 func requiresFullTextTokens(ck schema.ChunkDoc) bool {
-	return strings.TrimSpace(ck.Summary) != "" || strings.TrimSpace(schema.ContextualText(ck)) != ""
+	return strings.TrimSpace(ck.ContextualWithWeight) != "" || strings.TrimSpace(ck.Summary) != "" || strings.TrimSpace(schema.ContextualText(ck)) != ""
 }
 
 // requiresEmbeddingVector uses the same cleaning as the embed path

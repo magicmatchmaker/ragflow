@@ -16,11 +16,7 @@
 
 package schema
 
-import (
-	"errors"
-
-	"ragflow/internal/common"
-)
+import "ragflow/internal/common"
 
 // TagLabel is a single labeled record from the tag definition file:
 // a piece of content and the tags associated with it.
@@ -113,8 +109,8 @@ type SummaryExtractConfig struct {
 
 // ContextualRetrievalConfig configures Anthropic-style contextual retrieval:
 // one short document-aware prefix is generated per chunk. The Extractor keeps
-// the raw chunk text untouched and places prefix+raw text in the transient
-// Summary channel consumed by Tokenizer for BM25 and embedding.
+// the raw chunk text untouched and places prefix+raw text in the dedicated
+// contextual_with_weight field consumed by Tokenizer for BM25 and embedding.
 type ContextualRetrievalConfig struct {
 	Enabled      bool   `json:"enabled"`
 	SystemPrompt string `json:"system_prompt,omitempty"`
@@ -152,9 +148,6 @@ func (ExtractorParam) Defaults() ExtractorParam {
 }
 
 func (p *ExtractorParam) Validate() error {
-	if p.Contextual.Enabled && p.Summary.Enabled {
-		return errors.New("contextual retrieval and summary extraction cannot both write the summary channel")
-	}
 	return nil
 }
 

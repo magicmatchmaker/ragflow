@@ -88,13 +88,11 @@ func RerankByModel(
 		tks := buildRerankTokens(chunk, cfield, 1, 1, 1)
 		insTw = append(insTw, tks)
 
-		// Feed the reranker the natural chunk text (markup preserved), not the
-		// tokenized content_ltks. Neural rerankers score stemmed / accent-split
-		// tokens far lower, which collapses relevance scores and forces an
-		// artificially low similarity_threshold. The natural text is passed
-		// as-is; common.RemoveRedundantSpaces is only applied to the tokenized
-		// fallback used when content_with_weight is absent, where it drops the
-		// space before punctuation tokens. Mirrors rag/nlp/search.py.
+		// Feed the reranker the natural contextual search text when available,
+		// falling back to raw content_with_weight for ordinary and pre-migration
+		// chunks. Never feed tokenized content_ltks unless both natural fields are
+		// absent. The natural text is passed through unchanged; redundant-space
+		// cleanup is only for the tokenized fallback.
 		docText := extractNaturalText(chunk)
 		if docText == "" {
 			docText = common.RemoveRedundantSpaces(strings.Join(tks, " "))
@@ -457,14 +455,18 @@ func extractContentTokens(fields map[string]interface{}, cfield string) []string
 	return result
 }
 
-// extractNaturalText returns the natural chunk text (content_with_weight),
-// or "" when the field is absent or not a string.
+// extractNaturalText returns the natural text intended for the cross-encoder.
+// Contextual chunks carry their document-aware prefix + raw body in
+// contextual_with_weight. Ordinary and pre-migration chunks fall back to the raw
+// content_with_weight used for answers and citations. Natural text is returned
+// byte-for-byte; whitespace is inspected only to decide whether to fall back.
 func extractNaturalText(fields map[string]interface{}) string {
-	v, ok := fields["content_with_weight"].(string)
-	if !ok {
-		return ""
+	for _, key := range []string{common.ContextualContentField, "content_with_weight"} {
+		if v, ok := fields[key].(string); ok && strings.TrimSpace(v) != "" {
+			return v
+		}
 	}
-	return v
+	return ""
 }
 
 // extractTitleTokens extracts title tokens from chunk fields

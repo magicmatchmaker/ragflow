@@ -8,6 +8,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"ragflow/internal/common"
 )
 
 func TestExtractorContextualRetrievalKeepsGenerationTextAndSeparatesSearchText(t *testing.T) {
@@ -38,9 +40,12 @@ func TestExtractorContextualRetrievalKeepsGenerationTextAndSeparatesSearchText(t
 	if got[0]["docling_raw_text"] != "ALARM 37" {
 		t.Fatalf("raw provenance changed: %#v", got[0]["docling_raw_text"])
 	}
-	wantSummary := "롤프레스 BCR 조명 불량 진단 문맥\n\n빨간 표시등과 ALARM 37이 보인다."
-	if got[0]["summary"] != wantSummary {
-		t.Fatalf("summary = %#v, want contextual prefix + generation text", got[0]["summary"])
+	wantContextual := "롤프레스 BCR 조명 불량 진단 문맥\n\n빨간 표시등과 ALARM 37이 보인다."
+	if got[0][common.ContextualContentField] != wantContextual {
+		t.Fatalf("contextual_with_weight = %#v, want contextual prefix + generation text", got[0][common.ContextualContentField])
+	}
+	if _, exists := got[0]["summary"]; exists {
+		t.Fatalf("contextual retrieval must not reuse the summary channel: %#v", got[0])
 	}
 	if calls := stub.Calls(); calls != 2 {
 		t.Fatalf("LLM calls = %d, want one per chunk", calls)
@@ -108,12 +113,12 @@ func TestExtractorContextualRetrievalFailureIsNotSilentlySkipped(t *testing.T) {
 	}
 }
 
-func TestExtractorRejectsContextualAndSummaryCollision(t *testing.T) {
+func TestExtractorAllowsContextualAndSummaryOnSeparateFields(t *testing.T) {
 	_, err := NewExtractorComponent(map[string]any{
 		"contextual": map[string]any{"enabled": true},
 		"summary":    map[string]any{"enabled": true},
 	})
-	if err == nil || !strings.Contains(err.Error(), "cannot both write") {
-		t.Fatalf("error = %v", err)
+	if err != nil {
+		t.Fatalf("separate contextual_with_weight and summary fields should validate: %v", err)
 	}
 }

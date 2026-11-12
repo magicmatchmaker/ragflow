@@ -751,10 +751,11 @@ func (s *RetrievalService) Search(ctx context.Context, req *RetrievalSearchReque
 		"doc_id", "chunk_order_int", "page_num_int", "top_int", "create_timestamp_flt", "type_kwd", "knowledge_graph_kwd",
 		// Fields the projection below reads off each chunk. This list IS the ES
 		// _source filter, so omitting one returns it empty even though the
-		// document carries it: content_with_weight is the text the caller
-		// displays, doc_type_kwd marks image/table chunks, mom_id is what promotes
-		// child fragments to their parent, row_id() the table row identity.
-		"content_with_weight", "doc_type_kwd", "mom_id", "row_id()",
+		// document carries it: content_with_weight is the raw text the caller
+		// displays, contextual_with_weight is the natural prefix+raw text used only by
+		// the model reranker, doc_type_kwd marks image/table chunks, mom_id is what
+		// promotes child fragments to their parent, row_id() the table row identity.
+		"content_with_weight", common.ContextualContentField, "doc_type_kwd", "mom_id", "row_id()",
 		"compile_kwd", "scope_kwd",
 		// Generated questions: question_tks feeds the reranker's term input (×6),
 		// question_kwd is what the dataset search API reports as "questions".

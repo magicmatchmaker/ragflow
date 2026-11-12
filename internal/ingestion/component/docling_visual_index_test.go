@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"ragflow/internal/common"
 	"ragflow/internal/ingestion/component/schema"
 	"ragflow/internal/ingestion/task/indexdoc"
 )
@@ -15,11 +16,11 @@ import (
 func TestDoclingVisualDescriptionSurvivesEmbeddingAndGenerationIndexContent(t *testing.T) {
 	const generationText = "설비 알람 화면. 빨간 표시등과 ALARM 37이 보인다."
 	chunks := []schema.ChunkDoc{{
-		Text:    generationText,
-		DocType: "image",
-		Summary: "롤프레스 BCR 조명 불량 진단 문맥\n\n" + generationText,
+		Text:                 generationText,
+		DocType:              "image",
+		ContextualWithWeight: "롤프레스 BCR 조명 불량 진단 문맥\n\n" + generationText,
 	}}
-	if embedded := concatFields(chunks[0], []string{"summary"}); !strings.Contains(embedded, "롤프레스") || !strings.Contains(embedded, "ALARM 37") {
+	if embedded := concatFields(chunks[0], []string{common.ContextualContentField}); !strings.Contains(embedded, "롤프레스") || !strings.Contains(embedded, "ALARM 37") {
 		t.Fatalf("embedding input = %q, want contextual prefix and visual text", embedded)
 	}
 
@@ -30,7 +31,10 @@ func TestDoclingVisualDescriptionSurvivesEmbeddingAndGenerationIndexContent(t *t
 	if got := rows[0]["content_with_weight"]; got != generationText {
 		t.Fatalf("content_with_weight = %#v; answer model would lose Docling visual description", got)
 	}
+	if got := rows[0][common.ContextualContentField]; got != chunks[0].ContextualWithWeight {
+		t.Fatalf("contextual_with_weight = %#v, want indexed natural contextual text %q", got, chunks[0].ContextualWithWeight)
+	}
 	if _, exists := rows[0]["summary"]; exists {
-		t.Fatalf("transient contextual search text leaked into generation content: %#v", rows[0])
+		t.Fatalf("summary unexpectedly reached the index document: %#v", rows[0])
 	}
 }

@@ -520,6 +520,52 @@ func TestRetrievalProjectsRankFeatureFields(t *testing.T) {
 	}
 }
 
+func TestRetrievalProjectsContextualRerankerFieldWithoutExposingIt(t *testing.T) {
+	newRetrievalTestDB(t, "doc-1")
+	oldQueryBuilder := globalQueryBuilder
+	globalQueryBuilder = NewQueryBuilder()
+	defer func() { globalQueryBuilder = oldQueryBuilder }()
+
+	docEngine := &retrievalCountEngine{rows: []map[string]interface{}{{
+		"id":                          "chunk-1",
+		"doc_id":                      "doc-1",
+		"content_ltks":                "alpha",
+		"content_with_weight":         "raw citation body",
+		common.ContextualContentField: "document-aware prefix\n\nraw citation body",
+		"_score":                      0.9,
+	}}}
+	service := NewRetrievalService(docEngine, &dao.DocumentDAO{})
+	threshold := 0.0
+	vectorWeight := 1.0
+	aggs := false
+	result, err := service.Retrieval(t.Context(), &RetrievalRequest{
+		Question:               "alpha",
+		TenantIDs:              []string{"tenant-1"},
+		Page:                   1,
+		PageSize:               1,
+		SimilarityThreshold:    &threshold,
+		VectorSimilarityWeight: &vectorWeight,
+		Aggs:                   &aggs,
+	})
+	if err != nil {
+		t.Fatalf("Retrieval failed: %v", err)
+	}
+	if len(docEngine.selectedFields) == 0 {
+		t.Fatal("no search was issued")
+	}
+	for _, fields := range docEngine.selectedFields {
+		if !slices.Contains(fields, common.ContextualContentField) {
+			t.Fatalf("search fields = %v, want %s", fields, common.ContextualContentField)
+		}
+	}
+	if len(result.Chunks) != 1 || result.Chunks[0]["content_with_weight"] != "raw citation body" {
+		t.Fatalf("retrieval chunks = %#v, want raw answer/citation content", result.Chunks)
+	}
+	if _, exposed := result.Chunks[0][common.ContextualContentField]; exposed {
+		t.Fatalf("internal reranker field leaked into retrieval response: %#v", result.Chunks[0])
+	}
+}
+
 // TestRetrievalProjectsQuestionTokenFields pins the same projection contract for
 // the generated-question fields. The reranker folds question_tks into its term
 // input with a ×6 weight and the dataset search API reports question_kwd as

@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"ragflow/internal/agent/runtime"
+	"ragflow/internal/common"
 	"ragflow/internal/entity/models"
 	"ragflow/internal/ingestion/component/schema"
 	"ragflow/internal/tokenizer"
@@ -276,6 +277,50 @@ func TestTokenizerComponent_FullTextIncludesMediaContext(t *testing.T) {
 	}
 	if got := chunks[0]["content_sm_ltks"]; got != "above table body below" {
 		t.Fatalf("content_sm_ltks = %q, want contextual text", got)
+	}
+}
+
+func TestTokenizerComponent_ContextualSearchTextDrivesFullTextAndEmbedding(t *testing.T) {
+	tokenizer.SetEngineType("infinity")
+	defer tokenizer.SetEngineType("")
+
+	const (
+		raw        = "raw body"
+		contextual = "prefix-only-marker\n\n" + raw
+	)
+	stub := newStubEmbedder(3)
+	comp, err := NewTokenizerComponentWithResolver(
+		map[string]any{
+			"search_method": []any{"full_text", "embedding"},
+			"fields":        common.ContextualContentField,
+		},
+		func(context.Context, string, string) (Embedder, string, error) {
+			return stub, "", nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewTokenizerComponentWithResolver: %v", err)
+	}
+	out, err := comp.(*TokenizerComponent).Invoke(t.Context(), nil, map[string]any{
+		"kb_id":         "kb-1",
+		"output_format": "chunks",
+		"chunks": []map[string]any{{
+			"text":                        raw,
+			common.ContextualContentField: contextual,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	chunks, _ := schema.ChunkCarrierToMaps(out["chunks"])
+	if got := chunks[0]["content_ltks"]; got != contextual {
+		t.Fatalf("content_ltks = %q, want contextual BM25 text %q", got, contextual)
+	}
+	if len(stub.callInputs) != 1 || len(stub.callInputs[0]) != 1 || stub.callInputs[0][0] != contextual {
+		t.Fatalf("embedding inputs = %#v, want contextual text %q", stub.callInputs, contextual)
+	}
+	if got := chunks[0]["text"]; got != raw {
+		t.Fatalf("raw generation text changed: %#v", got)
 	}
 }
 

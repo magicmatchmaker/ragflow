@@ -863,10 +863,10 @@ func (c *ExtractorComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 }
 
 // runContextualRetrieval implements the per-chunk contextual-prefix stage from
-// Anthropic's Contextual Retrieval design. It deliberately stores the enriched
-// search text in summary while leaving ck["text"] byte-for-byte unchanged:
-// Tokenizer already uses summary for BM25 tokens and, with fields=["summary"],
-// for embeddings; indexdoc later deletes summary and persists raw text.
+// Anthropic's Contextual Retrieval design. It stores the enriched natural
+// search text in its own indexed field while leaving ck["text"] byte-for-byte
+// unchanged for answer generation and citations. Tokenizer uses the contextual
+// field for BM25 tokens and embeddings.
 func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gorm.DB, in extractorInputs, w progress.Window) error {
 	if !c.Param.Contextual.Enabled {
 		return nil
@@ -895,7 +895,7 @@ func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gor
 		if strings.TrimSpace(rawText) == "" {
 			continue
 		}
-		if existing, _ := ck["summary"].(string); strings.TrimSpace(existing) != "" {
+		if existing, _ := ck[common.ContextualContentField].(string); strings.TrimSpace(existing) != "" {
 			continue
 		}
 		prompt := contextualRetrievalUserPrompt(rawText, document)
@@ -908,7 +908,7 @@ func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gor
 			if prefix == "" {
 				return fmt.Errorf("contextual retrieval chunk %d returned an empty prefix", i)
 			}
-			ck["summary"] = prefix + "\n\n" + rawText
+			ck[common.ContextualContentField] = prefix + "\n\n" + rawText
 			return nil
 		}
 		future, err := extractorPool.Submit(ctx, fn)
@@ -919,7 +919,7 @@ func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gor
 	}
 	if len(futs) == 0 {
 		for _, ck := range in.chunks {
-			if summary, _ := ck["summary"].(string); strings.TrimSpace(summary) != "" {
+			if contextual, _ := ck[common.ContextualContentField].(string); strings.TrimSpace(contextual) != "" {
 				return nil
 			}
 		}
