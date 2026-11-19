@@ -77,6 +77,41 @@ func TestExtractorContextualRetrievalKeepsGenerationTextAndSeparatesSearchText(t
 	}
 }
 
+func TestExtractorContextualRetrievalSkipsDerivedSlidePreview(t *testing.T) {
+	stub := withStubChatInvoker(t, stubResponse{Content: "문서 의미 문맥"})
+	component, err := NewExtractorComponent(map[string]any{
+		"llm_id":     "qwen3.8-flash-next@openai",
+		"contextual": map[string]any{"enabled": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := []map[string]any{
+		{"id": "semantic-1", "text": "ALARM 37의 조치 순서"},
+		{"id": "slide-1", "text": "ALARM 37의 조치 순서", doclingSlidePreviewChunkKey: true, "img_id": "slide-image"},
+	}
+	out, err := component.Invoke(t.Context(), nil, map[string]any{"chunks": chunks})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	got := out["chunks"].([]map[string]any)
+	if calls := stub.Calls(); calls != 1 {
+		t.Fatalf("LLM calls = %d, want semantic chunks only", calls)
+	}
+	if got[0][common.ContextualContentField] != "문서 의미 문맥\n\nALARM 37의 조치 순서" {
+		t.Fatalf("semantic context = %#v", got[0][common.ContextualContentField])
+	}
+	if got[1][common.ContextualContentField] != "ALARM 37의 조치 순서" {
+		t.Fatalf("preview search text = %#v", got[1][common.ContextualContentField])
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	prompt := stub.requests[0].Messages[len(stub.requests[0].Messages)-1].Content
+	if strings.Count(prompt, "ALARM 37의 조치 순서") != 2 {
+		t.Fatalf("prompt duplicated preview text: %s", prompt)
+	}
+}
+
 func TestExtractorContextualRetrievalRejectsSilentContextTruncation(t *testing.T) {
 	SetExtractorContextLengthOverride(func(_ context.Context, _ string) int { return 200 })
 	t.Cleanup(func() { SetExtractorContextLengthOverride(nil) })
@@ -93,6 +128,30 @@ func TestExtractorContextualRetrievalRejectsSilentContextTruncation(t *testing.T
 	}
 	if calls := stub.Calls(); calls != 0 {
 		t.Fatalf("invoker calls = %d, want prompt rejected before provider call", calls)
+	}
+}
+
+func TestContextualDocumentWindowBoundsLargeManualAndKeepsOpeningAndLocalSection(t *testing.T) {
+	chunks := make([]map[string]any, 24)
+	for index := range chunks {
+		chunks[index] = map[string]any{
+			"id":   "chunk",
+			"text": strings.Repeat(string(rune('A'+index)), 180),
+		}
+	}
+	const target = 18
+	got := contextualDocumentWindow(chunks, target, 1100)
+	if len([]rune(got)) > 1100 {
+		t.Fatalf("window runes = %d, want <= 1100", len([]rune(got)))
+	}
+	if !strings.Contains(got, strings.Repeat("A", 40)) {
+		t.Fatal("window omitted document opening")
+	}
+	if !strings.Contains(got, strings.Repeat(string(rune('A'+target)), 40)) {
+		t.Fatal("window omitted target chunk")
+	}
+	if !strings.Contains(got, contextualDocumentOmissionMarker) {
+		t.Fatal("large window must mark omitted context explicitly")
 	}
 }
 

@@ -70,7 +70,7 @@ func TestDoclingContextualTemplateIsCompleteMigrationSource(t *testing.T) {
 	}
 
 	params := componentParamsForContract(t, components, "Parser:DoclingContextual")
-	for _, family := range []string{"pdf", "slides", "docx", "spreadsheet", "image"} {
+	for _, family := range []string{"pdf", "slides", "docx", "spreadsheet", "markdown", "image"} {
 		setup, ok := params[family].(map[string]any)
 		if !ok {
 			t.Fatalf("parser has no %s setup", family)

@@ -21,6 +21,7 @@ import (
 	"ragflow/internal/parser/media"
 	"ragflow/internal/parser/parser"
 	"ragflow/internal/storage"
+	"ragflow/internal/utility"
 )
 
 const uc1SourceSHA256 = "049be6d8626e7acecf17b5c536797b9f373b7d53ffe6909aa3ac3dbf5663d1d0"
@@ -81,6 +82,75 @@ func (c *presentationManualCache) Get(_ context.Context, ref entity.MediaRef) ([
 		return nil, media.ErrMediaNotFound
 	}
 	return media.ValidatePayload(append([]byte(nil), data...), ref)
+}
+
+// TestOchangDoclingPresentationRegression exercises the combined production
+// path on an operator-supplied PPTX without printing source text or image
+// bytes. Docling must retain semantic chunks, while the native presentation
+// path contributes exactly one resolvable full-slide PNG per slide.
+func TestOchangDoclingPresentationRegression(t *testing.T) {
+	path := os.Getenv("RAGFLOW_OCHANG_PPTX_PATH")
+	if path == "" {
+		t.Skip("RAGFLOW_OCHANG_PPTX_PATH is not set")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := &presentationManualCache{}
+	ctx := media.WithCache(t.Context(), cache)
+	parsed := parser.NewDoclingHybridParser(utility.FileTypePPTX).ParseWithResult(ctx, "ochang-regression.pptx", data)
+	if parsed.Err != nil {
+		t.Fatal(parsed.Err)
+	}
+
+	semanticCount := 0
+	slides := make(map[int]struct{})
+	for _, item := range parser.ItemsToMaps(parsed.JSON) {
+		if marked, _ := item[doclingPresentationPreviewSourceKey].(bool); marked {
+			if slide, ok := item["slide_number"].(int); ok && slide > 0 {
+				slides[slide] = struct{}{}
+			}
+			continue
+		}
+		semanticCount++
+	}
+	if semanticCount == 0 || len(slides) == 0 {
+		t.Fatalf("combined parse counts semantic=%d slides=%d", semanticCount, len(slides))
+	}
+
+	chunkerComponent, err := NewDoclingHybridChunker(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := chunkerComponent.Invoke(ctx, nil, map[string]any{
+		"name": "ochang-regression.pptx", "file_type": "pptx", "doc_id": "ochang-regression",
+		"output_format": "json", "json": parsed.JSON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, ok := schema.ChunkCarrierToMaps(out["chunks"])
+	if !ok {
+		t.Fatalf("unexpected chunk carrier %T", out["chunks"])
+	}
+	previewCount := 0
+	for _, chunk := range chunks {
+		if preview, _ := chunk[doclingSlidePreviewKey].(bool); !preview {
+			continue
+		}
+		previewCount++
+		data, _, err := component.ResolveMediaRef(ctx, chunk)
+		if err != nil {
+			t.Fatalf("preview %d resolve: %v", previewCount, err)
+		}
+		if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+			t.Fatalf("preview %d PNG: %v", previewCount, err)
+		}
+	}
+	if previewCount != len(slides) {
+		t.Fatalf("full-slide previews=%d slides=%d semantic=%d total=%d", previewCount, len(slides), semanticCount, len(chunks))
+	}
 }
 
 // TestUC1PresentationRegression verifies the real 52-slide source without

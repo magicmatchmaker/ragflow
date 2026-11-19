@@ -67,7 +67,7 @@ func (dao *API4ConversationDAO) UpdateHistory(ctx context.Context, db *gorm.DB, 
 	}
 	for key := range updates {
 		switch key {
-		case "message", "Message", "messages", "Messages", "reference", "Reference":
+		case "message", "Message", "messages", "Messages", "reference", "Reference", "version_id", "VersionID":
 			return errors.New("does not support")
 		}
 	}

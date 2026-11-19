@@ -113,7 +113,7 @@ func (h *AgentHandler) handleOpenAICompat(c *gin.Context, req *agentChatCompleti
 	runContext, cancel := context.WithCancel(service.WithOpenAICompatMessages(c.Request.Context(), req.Messages))
 	defer cancel()
 	events, err := h.chatRunner.RunAgent(
-		runContext, req.AgentID, req.SessionID, "", question, req.Files,
+		runContext, req.AgentID, req.SessionID, req.VersionID, question, req.Files,
 	)
 	if err != nil {
 		writeOpenAICompatError(c, err)

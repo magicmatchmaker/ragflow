@@ -34,6 +34,7 @@ type API4Conversation struct {
 	Round        int             `gorm:"column:round" json:"round"`
 	ThumbUp      int             `gorm:"column:thumb_up" json:"thumb_up"`
 	Errors       *string         `gorm:"column:errors;type:text" json:"errors,omitempty"`
+	VersionID    *string         `gorm:"column:version_id;size:32" json:"version_id,omitempty"`
 	VersionTitle *string         `gorm:"column:version_title;size:255" json:"version_title,omitempty"`
 	BaseModel
 }

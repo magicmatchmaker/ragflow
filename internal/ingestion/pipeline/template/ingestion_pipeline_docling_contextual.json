@@ -60,6 +60,14 @@
                                 "csv"
                             ]
                         },
+                        "markdown": {
+                            "parse_method": "DoclingHybrid",
+                            "suffix": [
+                                "md",
+                                "markdown",
+                                "mdx"
+                            ]
+                        },
                         "image": {
                             "parse_method": "DoclingHybrid",
                             "suffix": [
@@ -209,6 +217,10 @@
                                 },
                                 {
                                     "fileFormat": "spreadsheet",
+                                    "parse_method": "DoclingHybrid"
+                                },
+                                {
+                                    "fileFormat": "markdown",
                                     "parse_method": "DoclingHybrid"
                                 },
                                 {

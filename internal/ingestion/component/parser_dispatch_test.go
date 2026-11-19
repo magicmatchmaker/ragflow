@@ -75,6 +75,7 @@ func TestDoclingHybridSupportsVerifiedFormatsAndLeavesLegacyBinaryFormatsNative(
 		utility.FileTypePPTX,
 		utility.FileTypeXLSX,
 		utility.FileTypeCSV,
+		utility.FileTypeMarkdown,
 		utility.FileTypeVISUAL,
 	} {
 		if !doclingHybridSupports(fileType) {

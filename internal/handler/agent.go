@@ -1054,6 +1054,7 @@ func (h *AgentHandler) DeleteAgentSession(c *gin.Context) {
 type agentChatCompletionsRequest struct {
 	Question     string                   `json:"question,omitempty"`
 	AgentID      string                   `json:"agent_id"`
+	VersionID    string                   `json:"version_id,omitempty"`
 	Query        string                   `json:"query"`
 	Inputs       map[string]interface{}   `json:"inputs"`
 	SessionID    string                   `json:"session_id"`
@@ -1190,6 +1191,7 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 	common.Debug("agent chat completions: request received",
 		zap.String("user_id", user.ID),
 		zap.String("agent_id", req.AgentID),
+		zap.String("version_id", req.VersionID),
 		zap.String("session_id", req.SessionID),
 		zap.Bool("stream", req.Stream),
 		zap.Bool("openai_compatible", req.OpenAICompat),
@@ -1199,6 +1201,9 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 		zap.Int("inputs_with_values_count", countInputValues(req.Inputs)),
 		zap.Int("messages_count", len(req.Messages)),
 	)
+	if req.VersionID != "" {
+		c.Request = c.Request.WithContext(service.WithPublishedAgentVersionPin(c.Request.Context(), req.VersionID))
+	}
 
 	if req.OpenAICompat {
 		h.handleOpenAICompat(c, &req)
@@ -1256,7 +1261,7 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 	// its `len(files) > 0` guard sees a file-less run.
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
-	events, err := h.chatRunner.RunAgent(ctx, req.AgentID, req.SessionID, "", userInput, req.Files)
+	events, err := h.chatRunner.RunAgent(ctx, req.AgentID, req.SessionID, req.VersionID, userInput, req.Files)
 	if err != nil {
 		common.Warn("agent chat completions: RunAgent failed",
 			append([]zap.Field{

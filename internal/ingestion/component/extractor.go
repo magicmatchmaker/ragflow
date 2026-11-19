@@ -71,6 +71,8 @@ import (
 // reference the same identity.
 const componentNameExtractor = schema.ComponentNameExtractor
 
+const doclingSlidePreviewChunkKey = "docling_slide_preview"
+
 // A zero default leaves long indexing calls bounded only by task cancellation.
 // Operators may still set EXTRACTOR_CHAT_TIMEOUT to a positive per-attempt
 // budget; this is not a document-level deadline.
@@ -198,6 +200,14 @@ Mention only information supported by the supplied document: document/section/to
 relevant entities, equipment or process, and why this chunk matters. Preserve model
 numbers, alarms, values, and terminology exactly. Use the same language as the chunk.
 Do not summarize the chunk, answer it, add Markdown, or add facts. Output the prefix only.`
+
+	// Keep the explicit document context comfortably below the 65,536-token
+	// Qwen serving limit even for Korean-heavy manuals and spreadsheet rows.
+	// Small documents still use their complete byte-identical prefix (and keep
+	// vLLM prefix-cache reuse); large documents use an explicit opening + local
+	// semantic window. The target chunk is never silently truncated.
+	defaultContextualDocumentMaxRunes = 32000
+	contextualDocumentOmissionMarker  = "\n\n--- [document context omitted] ---\n\n"
 )
 
 // ExtractorComponent performs LLM-based extraction over a chunk
@@ -895,10 +905,21 @@ func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gor
 		if strings.TrimSpace(rawText) == "" {
 			continue
 		}
+		// Full-slide previews are retrieval/provenance companions to the
+		// authoritative Docling semantic chunks. Sending their duplicate slide
+		// text through Contextual Retrieval multiplies LLM work and pollutes the
+		// shared document prefix without adding meaning. Keep the preview
+		// searchable using its raw text while contextualizing every semantic
+		// chunk exactly once.
+		if isDoclingSlidePreviewChunk(ck) {
+			ck[common.ContextualContentField] = rawText
+			continue
+		}
 		if existing, _ := ck[common.ContextualContentField].(string); strings.TrimSpace(existing) != "" {
 			continue
 		}
-		prompt := contextualRetrievalUserPrompt(rawText, document)
+		documentWindow := contextualDocumentWindow(in.chunks, i, defaultContextualDocumentMaxRunes)
+		prompt := contextualRetrievalUserPrompt(rawText, documentWindow)
 		fn := func() error {
 			prefix, err := c.callTextCached(ctx, db, ctxIn, taskType, systemPrompt, prompt, chunkCacheID(ck))
 			if err != nil {
@@ -931,6 +952,9 @@ func (c *ExtractorComponent) runContextualRetrieval(ctx context.Context, db *gor
 func contextualDocumentText(chunks []map[string]any) string {
 	parts := make([]string, 0, len(chunks))
 	for _, ck := range chunks {
+		if isDoclingSlidePreviewChunk(ck) {
+			continue
+		}
 		// Docling Hybrid text already carries headings, captions, and native
 		// picture descriptions. It is also the generation content persisted by
 		// indexdoc; raw_text stays in docling_raw_text as source provenance.
@@ -940,6 +964,124 @@ func contextualDocumentText(chunks []map[string]any) string {
 		}
 	}
 	return strings.Join(parts, "\n\n---\n\n")
+}
+
+// contextualDocumentWindow returns the whole semantic document when it fits.
+// For large manuals it builds an explicit, deterministic window from the
+// document opening plus chunks nearest the target. This preserves document
+// identity and local section context without depending on the generic message
+// fitter (which may not know the provider's real deployed context limit).
+func contextualDocumentWindow(chunks []map[string]any, targetChunkIndex, maxRunes int) string {
+	full := contextualDocumentText(chunks)
+	if maxRunes <= 0 || len([]rune(full)) <= maxRunes {
+		return full
+	}
+	type semanticPart struct {
+		chunkIndex int
+		text       string
+	}
+	parts := make([]semanticPart, 0, len(chunks))
+	targetPart := -1
+	for chunkIndex, chunk := range chunks {
+		if isDoclingSlidePreviewChunk(chunk) {
+			continue
+		}
+		text := strings.TrimSpace(extractorChunkText(chunk))
+		if text == "" {
+			continue
+		}
+		if chunkIndex == targetChunkIndex {
+			targetPart = len(parts)
+		}
+		parts = append(parts, semanticPart{chunkIndex: chunkIndex, text: text})
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if targetPart < 0 {
+		targetPart = 0
+	}
+	selected := map[int]bool{targetPart: true}
+	render := func(selection map[int]bool) string {
+		var builder strings.Builder
+		previous := -2
+		for index, part := range parts {
+			if !selection[index] {
+				continue
+			}
+			if builder.Len() > 0 {
+				if index != previous+1 {
+					builder.WriteString(contextualDocumentOmissionMarker)
+				} else {
+					builder.WriteString("\n\n---\n\n")
+				}
+			}
+			builder.WriteString(part.text)
+			previous = index
+		}
+		return builder.String()
+	}
+	trySelect := func(index int) bool {
+		if index < 0 || index >= len(parts) || selected[index] {
+			return false
+		}
+		selected[index] = true
+		if len([]rune(render(selected))) > maxRunes {
+			delete(selected, index)
+			return false
+		}
+		return true
+	}
+
+	// Reserve roughly one fifth for the opening, which usually carries the
+	// manual/equipment identity. Stop before it crowds out the local section.
+	openingLimit := maxRunes / 5
+	for index := 0; index < len(parts) && index < targetPart; index++ {
+		before := len([]rune(render(selected)))
+		if !trySelect(index) {
+			break
+		}
+		if len([]rune(render(selected)))-before > openingLimit {
+			delete(selected, index)
+			break
+		}
+		openingLimit -= len([]rune(parts[index].text))
+		if openingLimit <= 0 {
+			break
+		}
+	}
+
+	// Fill the remaining budget from the target outward, preferring preceding
+	// context and then following context at each distance.
+	for distance := 1; distance < len(parts); distance++ {
+		added := false
+		if trySelect(targetPart - distance) {
+			added = true
+		}
+		if trySelect(targetPart + distance) {
+			added = true
+		}
+		if !added && targetPart-distance < 0 && targetPart+distance >= len(parts) {
+			break
+		}
+	}
+	return render(selected)
+}
+
+func isDoclingSlidePreviewChunk(chunk map[string]any) bool {
+	value, ok := chunk[doclingSlidePreviewChunkKey]
+	if !ok {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return err == nil && parsed
+	default:
+		return false
+	}
 }
 
 func contextualRetrievalUserPrompt(chunkText, documentText string) string {

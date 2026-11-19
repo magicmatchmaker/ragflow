@@ -102,6 +102,12 @@ type agentChannelNameContextKey struct{}
 
 type openAICompatMessagesContextKey struct{}
 
+type publishedAgentVersionPinContextKey struct{}
+
+type publishedAgentVersionPin struct {
+	versionID string
+}
+
 // WithAgentSessionID lets an HTTP boundary allocate the session identity while
 // keeping session-record persistence inside AgentService.RunAgent.
 func WithAgentSessionID(ctx context.Context, sessionID string) context.Context {
@@ -115,6 +121,22 @@ func AgentSessionIDFromContext(ctx context.Context) string {
 	}
 	sessionID, _ := ctx.Value(agentSessionIDContextKey{}).(string)
 	return sessionID
+}
+
+// WithPublishedAgentVersionPin marks a production run that must execute the
+// exact released version supplied by the HTTP boundary. Editor runs that use
+// the /run?version= debug path deliberately do not carry this marker, so they
+// can continue to execute an unreleased saved version.
+func WithPublishedAgentVersionPin(ctx context.Context, versionID string) context.Context {
+	return context.WithValue(ctx, publishedAgentVersionPinContextKey{}, publishedAgentVersionPin{versionID: versionID})
+}
+
+func publishedAgentVersionPinFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	pin, ok := ctx.Value(publishedAgentVersionPinContextKey{}).(publishedAgentVersionPin)
+	return pin.versionID, ok
 }
 
 // withAgentChannelName lets a chat-channel boundary record the channel name so
@@ -1700,7 +1722,9 @@ func (s *AgentService) ApplyVersion(ctx context.Context, canvasID, versionID str
 //
 // sessionID is required for the multi-turn cycle: the handler generates
 // one (UUID) on the first call and reuses it on follow-up posts. version
-// selects the published UserCanvasVersion row; "" uses the latest version.
+// selects an exact saved UserCanvasVersion row; "" uses the editable draft.
+// A published-version context pin additionally requires that exact row to be
+// released and binds every continuation to it.
 //
 // The per-run RunFunc is built by buildRunFunc — see its doc comment
 // for the full production chain (real Compile/Invoke, resume path,
@@ -1718,6 +1742,14 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 		sessionID = common.GenerateToken()
 	}
 	trustedFirstTouch := AgentSessionIDFromContext(ctx) == sessionID
+	publishedVersionID, publishedVersionRun := publishedAgentVersionPinFromContext(ctx)
+	if publishedVersionRun && (publishedVersionID == "" || publishedVersionID != version) {
+		return nil, fmt.Errorf("RunAgent: published version pin does not match requested version: %w", dao.ErrUserCanvasVersionNotFound)
+	}
+	if publishedVersionRun && (s.api4ConversationDAO == nil || s.versionDAO == nil || dao.DB == nil) {
+		return nil, fmt.Errorf("RunAgent: published version storage is not configured: %w", ErrAgentStorageError)
+	}
+	var initialSession *entity.API4Conversation
 	if !newSession && s.api4ConversationDAO != nil && dao.DB != nil {
 		existingSession, err := s.api4ConversationDAO.GetMetadataBySessionID(ctx, dao.DB, sessionID, canvasID)
 		if err != nil {
@@ -1730,6 +1762,32 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 		} else if err := checkAgentSessionRunPermission(ctx, sessionID); err != nil {
 			return nil, fmt.Errorf("RunAgent: session %q not found: %w", sessionID, err)
 		}
+		initialSession = existingSession
+	}
+
+	var versionRow *entity.UserCanvasVersion
+	if version != "" {
+		row, err := s.versionDAO.GetByID(ctx, dao.DB, version)
+		if err != nil {
+			if errors.Is(err, dao.ErrUserCanvasVersionNotFound) {
+				return nil, fmt.Errorf("RunAgent: load version %q: %w", version, err)
+			}
+			return nil, fmt.Errorf("RunAgent: load version %q: %w: %w", version, err, ErrAgentStorageError)
+		}
+		if row.UserCanvasID != canvasID {
+			return nil, fmt.Errorf(
+				"RunAgent: version %q belongs to canvas %q, not %q: %w",
+				version, row.UserCanvasID, canvasID,
+				dao.ErrUserCanvasVersionNotFound,
+			)
+		}
+		if publishedVersionRun && !row.Release {
+			return nil, fmt.Errorf("RunAgent: published version %q is not released: %w", version, dao.ErrUserCanvasVersionNotFound)
+		}
+		versionRow = row
+	}
+	if err := validateAgentSessionVersionPin(initialSession, version, publishedVersionRun); err != nil {
+		return nil, fmt.Errorf("RunAgent: session %q: %w", sessionID, err)
 	}
 	messageID := common.GenerateToken()
 	questionSaved := false
@@ -1743,6 +1801,9 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 		}
 		if session == nil {
 			return nil
+		}
+		if err := validateAgentSessionVersionPin(session, version, publishedVersionRun); err != nil {
+			return fmt.Errorf("RunAgent: session %q: %w", sessionID, err)
 		}
 		if err := checkAgentSessionRunPermission(ctx, sessionID); err != nil {
 			return fmt.Errorf("RunAgent: session %q not found: %w", sessionID, err)
@@ -1902,10 +1963,7 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 	//
 	// The buildRunFunc placeholder branch is reserved for the rare
 	// "canvas exists but has no DSL at all" edge case.
-	var (
-		versionRow *entity.UserCanvasVersion
-		dsl        map[string]any
-	)
+	var dsl map[string]any
 	channelRun, _ := ctx.Value(channelAgentRunContextKey{}).(bool)
 	refreshSessionDSL := channelRun && version == ""
 	paused := s.runner != nil && s.runner.Peek(canvasID, sessionID)
@@ -1920,25 +1978,7 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 			paused = true
 		}
 	}
-	if version != "" {
-		row, err := s.versionDAO.GetByID(ctx, dao.DB, version)
-		if err != nil {
-			if errors.Is(err, dao.ErrUserCanvasVersionNotFound) {
-				return nil, fmt.Errorf("RunAgent: load version %q: %w", version, err)
-			}
-			return nil, fmt.Errorf("RunAgent: load version %q: %w: %w", version, err, ErrAgentStorageError)
-		}
-		if row.UserCanvasID != canvasID {
-			// IDOR — caller asked to run version X against canvas
-			// Y, but version X belongs to canvas Z. Surface the
-			// same "not found" envelope the read path uses.
-			return nil, fmt.Errorf(
-				"RunAgent: version %q belongs to canvas %q, not %q: %w",
-				version, row.UserCanvasID, canvasID,
-				dao.ErrUserCanvasVersionNotFound,
-			)
-		}
-		versionRow = row
+	if versionRow != nil {
 		dsl = normalisedDSLForRun(versionRow)
 	} else if len(canvasRow.DSL) > 0 {
 		dsl = dslpkg.NormalizeForRun(canvasRow.DSL)
@@ -1952,6 +1992,9 @@ func (s *AgentService) RunAgent(ctx context.Context, canvasID, sessionID, versio
 		if existingSession != nil {
 			if err := checkAgentSessionRunPermission(ctx, sessionID); err != nil {
 				return nil, fmt.Errorf("RunAgent: session %q not found: %w", sessionID, err)
+			}
+			if err := validateAgentSessionVersionPin(existingSession, version, publishedVersionRun); err != nil {
+				return nil, fmt.Errorf("RunAgent: session %q: %w", sessionID, err)
 			}
 		}
 		sessionFound = existingSession != nil
@@ -2119,7 +2162,7 @@ func (s *AgentService) runReleasedAgent(ctx context.Context, canvasID, sessionID
 	if err != nil {
 		return nil, fmt.Errorf("load latest released version for canvas %q: %w", canvasID, err)
 	}
-	return s.RunAgent(ctx, canvasID, sessionID, version.ID, userInput, files)
+	return s.RunAgent(WithPublishedAgentVersionPin(ctx, version.ID), canvasID, sessionID, version.ID, userInput, files)
 }
 
 // validateAgentChatModels rejects stale Agent model references before execution.
@@ -2175,6 +2218,22 @@ func checkAgentSessionRunPermission(ctx context.Context, sessionID string) error
 	}
 	if err != nil {
 		return fmt.Errorf("check agent session run permission: %w: %w", err, ErrAgentStorageError)
+	}
+	return nil
+}
+
+func validateAgentSessionVersionPin(session *entity.API4Conversation, versionID string, publishedVersionRun bool) error {
+	if session == nil {
+		return nil
+	}
+	if session.VersionID == nil {
+		if !publishedVersionRun {
+			return nil
+		}
+		return fmt.Errorf("published session has no version pin: %w", dao.ErrUserCanvasVersionNotFound)
+	}
+	if !publishedVersionRun || *session.VersionID != versionID {
+		return fmt.Errorf("published session version does not match %q: %w", versionID, dao.ErrUserCanvasVersionNotFound)
 	}
 	return nil
 }
@@ -2703,6 +2762,9 @@ func (s *AgentService) createAgentRunSession(
 	}
 	if versionRow != nil {
 		session.VersionTitle = versionRow.Title
+		if _, publishedVersionRun := publishedAgentVersionPinFromContext(ctx); publishedVersionRun {
+			session.VersionID = &versionRow.ID
+		}
 	}
 	return s.api4ConversationDAO.Create(ctx, dao.DB, session)
 }

@@ -644,6 +644,223 @@ func TestRunAgent_VersionNotFound(t *testing.T) {
 	}
 }
 
+func TestRunAgentPublishedVersionPinRejectsUnreleasedVersionButEditorRunAllowsIt(t *testing.T) {
+	setupAgentSessionServiceTest(t)
+	createAgentSessionTestCanvas(t, "canvas-published-pin", "user-1")
+	if err := dao.DB.Create(&entity.UserCanvasVersion{
+		ID:           "version-unreleased",
+		UserCanvasID: "canvas-published-pin",
+		Release:      false,
+		DSL:          entity.JSONMap{},
+	}).Error; err != nil {
+		t.Fatalf("create unreleased version: %v", err)
+	}
+
+	baseCtx := serviceTestContext(t, "user-1", "user-1")
+	productionSessionID := "session-production-unreleased"
+	productionCtx := WithPublishedAgentVersionPin(
+		WithAgentSessionID(baseCtx, productionSessionID),
+		"version-unreleased",
+	)
+	if _, err := NewAgentService().RunAgent(
+		productionCtx,
+		"canvas-published-pin",
+		productionSessionID,
+		"version-unreleased",
+		"must not be persisted",
+		nil,
+	); !errors.Is(err, dao.ErrUserCanvasVersionNotFound) {
+		t.Fatalf("published unreleased RunAgent error = %v, want ErrUserCanvasVersionNotFound", err)
+	}
+	var productionSessions int64
+	if err := dao.DB.Model(&entity.API4Conversation{}).Where("id = ?", productionSessionID).Count(&productionSessions).Error; err != nil {
+		t.Fatalf("count rejected production sessions: %v", err)
+	}
+	if productionSessions != 0 {
+		t.Fatalf("rejected production run created %d sessions, want 0", productionSessions)
+	}
+
+	// The editor's explicit /run?version= path is intentionally not marked as
+	// a production pin, so a saved-but-unreleased version remains runnable.
+	editorSessionID := "session-editor-unreleased"
+	editorEvents, err := NewAgentService().RunAgent(
+		WithAgentSessionID(baseCtx, editorSessionID),
+		"canvas-published-pin",
+		editorSessionID,
+		"version-unreleased",
+		"editor probe",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("editor RunAgent rejected unreleased saved version: %v", err)
+	}
+	collectEventTypes(t, editorEvents)
+	stored, err := dao.NewAPI4ConversationDAO().GetMetadataBySessionID(baseCtx, dao.DB, editorSessionID, "canvas-published-pin")
+	if err != nil {
+		t.Fatalf("reload editor session: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("editor session was not persisted")
+	}
+	if stored.VersionID != nil {
+		t.Fatalf("editor draft session received production version_id %q", *stored.VersionID)
+	}
+}
+
+func TestRunAgentPublishedVersionPinPersistsAndResumesSameVersion(t *testing.T) {
+	setupAgentSessionServiceTest(t)
+	createAgentSessionTestCanvas(t, "canvas-published-resume", "user-1")
+	if err := dao.DB.Create(&entity.UserCanvasVersion{
+		ID:           "version-released",
+		UserCanvasID: "canvas-published-resume",
+		Release:      true,
+		DSL:          entity.JSONMap{},
+	}).Error; err != nil {
+		t.Fatalf("create released version: %v", err)
+	}
+
+	baseCtx := serviceTestContext(t, "user-1", "user-1")
+	sessionID := "session-published-resume"
+	pinnedCtx := WithPublishedAgentVersionPin(
+		WithAgentSessionID(baseCtx, sessionID),
+		"version-released",
+	)
+	svc := NewAgentService()
+	firstEvents, err := svc.RunAgent(
+		pinnedCtx,
+		"canvas-published-resume",
+		sessionID,
+		"version-released",
+		"first turn",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("first pinned run: %v", err)
+	}
+	collectEventTypes(t, firstEvents)
+	stored, err := dao.NewAPI4ConversationDAO().GetMetadataBySessionID(baseCtx, dao.DB, sessionID, "canvas-published-resume")
+	if err != nil {
+		t.Fatalf("reload pinned session: %v", err)
+	}
+	if stored == nil || stored.VersionID == nil || *stored.VersionID != "version-released" {
+		t.Fatalf("pinned session version_id = %v, want version-released", stored)
+	}
+	var messagesBeforeBypass int64
+	if err := dao.DB.Model(&entity.API4ConversationMessage{}).Where("conversation_id = ?", sessionID).Count(&messagesBeforeBypass).Error; err != nil {
+		t.Fatalf("count messages before unpinned bypass: %v", err)
+	}
+	if _, err := svc.RunAgent(
+		baseCtx,
+		"canvas-published-resume",
+		sessionID,
+		"",
+		"unpinned bypass must not be persisted",
+		nil,
+	); !errors.Is(err, dao.ErrUserCanvasVersionNotFound) {
+		t.Fatalf("unpinned resume error = %v, want ErrUserCanvasVersionNotFound", err)
+	}
+	var bypassMessages int64
+	if err := dao.DB.Model(&entity.API4ConversationMessage{}).Where("conversation_id = ?", sessionID).Count(&bypassMessages).Error; err != nil {
+		t.Fatalf("count unpinned bypass messages: %v", err)
+	}
+	if bypassMessages != messagesBeforeBypass {
+		t.Fatalf("unpinned bypass changed message count from %d to %d", messagesBeforeBypass, bypassMessages)
+	}
+	if err := dao.NewAPI4ConversationDAO().UpdateHistory(
+		baseCtx,
+		dao.DB,
+		sessionID,
+		"canvas-published-resume",
+		"user-1",
+		map[string]interface{}{"version_id": "version-released-other"},
+		dao.ConversationHistoryUpdate{},
+	); err == nil {
+		t.Fatal("UpdateHistory allowed version_id to be rewritten")
+	}
+
+	secondEvents, err := svc.RunAgent(
+		WithPublishedAgentVersionPin(baseCtx, "version-released"),
+		"canvas-published-resume",
+		sessionID,
+		"version-released",
+		"follow-up",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("same-version pinned resume: %v", err)
+	}
+	collectEventTypes(t, secondEvents)
+}
+
+func TestRunAgentPublishedVersionPinRejectsMismatchedAndLegacySessionsBeforePersistence(t *testing.T) {
+	setupAgentSessionServiceTest(t)
+	createAgentSessionTestCanvas(t, "canvas-published-mismatch", "user-1")
+	for _, versionID := range []string{"version-released-a", "version-released-b"} {
+		if err := dao.DB.Create(&entity.UserCanvasVersion{
+			ID:           versionID,
+			UserCanvasID: "canvas-published-mismatch",
+			Release:      true,
+			DSL:          entity.JSONMap{},
+		}).Error; err != nil {
+			t.Fatalf("create %s: %v", versionID, err)
+		}
+	}
+
+	versionA := "version-released-a"
+	for _, tc := range []struct {
+		name      string
+		sessionID string
+		versionID *string
+	}{
+		{name: "different version", sessionID: "session-version-a", versionID: &versionA},
+		{name: "legacy null version", sessionID: "session-legacy-null", versionID: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := dao.NewAPI4ConversationDAO().Create(t.Context(), dao.DB, &entity.API4Conversation{
+				ID:        tc.sessionID,
+				DialogID:  "canvas-published-mismatch",
+				UserID:    "user-1",
+				ExpUserID: sptr("user-1"),
+				Message:   json.RawMessage(`[]`),
+				DSL:       entity.JSONMap{},
+				VersionID: tc.versionID,
+			}); err != nil {
+				t.Fatalf("create test session: %v", err)
+			}
+
+			ctx := WithPublishedAgentVersionPin(
+				serviceTestContext(t, "user-1", "user-1"),
+				"version-released-b",
+			)
+			svc := NewAgentService()
+			if _, err := svc.RunAgent(
+				ctx,
+				"canvas-published-mismatch",
+				tc.sessionID,
+				"version-released-b",
+				"must not be persisted",
+				nil,
+			); !errors.Is(err, dao.ErrUserCanvasVersionNotFound) {
+				t.Fatalf("RunAgent error = %v, want ErrUserCanvasVersionNotFound", err)
+			}
+
+			var messages int64
+			if err := dao.DB.Model(&entity.API4ConversationMessage{}).Where("conversation_id = ?", tc.sessionID).Count(&messages).Error; err != nil {
+				t.Fatalf("count persisted messages: %v", err)
+			}
+			if messages != 0 {
+				t.Fatalf("mismatched pinned run persisted %d messages, want 0", messages)
+			}
+			svc.runMu.Lock()
+			activeRuns := len(svc.activeSessions)
+			svc.runMu.Unlock()
+			if activeRuns != 0 {
+				t.Fatalf("mismatched pinned run left %d active runs, want 0", activeRuns)
+			}
+		})
+	}
+}
+
 // TestRunAgent_NoVersionPublishedPlaceholder pins the legitimate
 // "no version published" branch: when version is empty AND
 // GetLatest returns ErrUserCanvasVersionNotFound (no rows), the

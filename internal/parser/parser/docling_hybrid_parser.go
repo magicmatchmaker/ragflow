@@ -30,7 +30,9 @@ import (
 	"time"
 
 	"ragflow/internal/common"
+	"ragflow/internal/entity"
 	models "ragflow/internal/entity/models"
+	"ragflow/internal/parser/tableutil"
 	"ragflow/internal/utility"
 )
 
@@ -44,10 +46,39 @@ const (
 	defaultDoclingPictureDescriptionArea    = 0.0
 	defaultDoclingPictureDescriptionPrompt  = "Describe this image faithfully for technical retrieval. Preserve visible labels, values, states, warnings, diagram relationships, and table contents. Use the document language and do not infer facts that are not visible."
 	doclingTrustedOrigin                    = "http://docling-serve:5001"
+	nativePresentationSemanticMaxRunes      = 6000
 )
+
+var errDoclingResponseTooLarge = errors.New("Docling response exceeds configured byte limit")
 
 // Test seam only; production keeps the shared bounded exponential backoff.
 var doclingRequestRetryDelay = common.DefaultRetryDelay
+
+// doclingPresentationParse keeps PPTX preview generation on RAGFlow's native
+// Go presentation path. Docling remains authoritative for semantic text
+// boundaries, while the native parser supplies slide geometry and embedded
+// media needed to render a faithful full-slide preview. The seam is overridden
+// only by unit tests; production always calls PPTXParser.
+var doclingPresentationParse = func(ctx context.Context, filename string, data []byte) ParseResult {
+	return NewPPTXParser().ParseWithResult(ctx, filename, data)
+}
+
+// doclingNativePDFParse is the bounded recovery path for a valid PDF that
+// Docling converts successfully but does not chunk. Prefer the deterministic
+// text layer first (it is both cheaper and more faithful for print-to-PDF
+// manuals), then use the native DeepDoc OCR/layout parser only when the text
+// layer itself is empty. The seam is overridden only by unit tests.
+var doclingNativePDFParse = func(ctx context.Context, filename string, data []byte) ParseResult {
+	plain := NewPDFParser()
+	plain.ParseMethod = "plain_text"
+	result := plain.ParseWithResult(ctx, filename, data)
+	if result.Err == nil && nativeItemsContainSemanticText(ItemsToMaps(result.JSON)) {
+		return result
+	}
+	return NewPDFParser().ParseWithResult(ctx, filename, data)
+}
+
+const doclingPresentationPreviewSourceKey = "docling_presentation_preview_source"
 
 var doclingHTTPClientCache struct {
 	sync.Mutex
@@ -141,6 +172,9 @@ func (p *DoclingHybridParser) ParseWithResult(ctx context.Context, filename stri
 	}
 	body, err := p.requestDocling(ctx, client, strings.TrimSuffix(serverURL, "/")+"/v1/chunk/hybrid/source", auth, payload)
 	if err != nil {
+		if p.fileType == utility.FileTypePPTX && errors.Is(err, errDoclingResponseTooLarge) {
+			return p.oversizedPresentationFallback(ctx, filename, data)
+		}
 		return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid request: %w", err)}
 	}
 	var decoded doclingHybridResponse
@@ -160,23 +194,238 @@ func (p *DoclingHybridParser) ParseWithResult(ctx context.Context, filename stri
 	if len(exported.JSONContent) == 0 {
 		return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid response omitted converted document JSON; include_converted_doc=true is required")}
 	}
-	if len(decoded.Chunks) == 0 {
+	if len(decoded.Chunks) == 0 && p.fileType == utility.FileTypePDF {
+		return p.emptyPDFChunksFallback(ctx, filename, data)
+	}
+	if len(decoded.Chunks) == 0 && p.fileType != utility.FileTypePPTX {
 		return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid response contained no chunks")}
 	}
 	content := exported.JSONContent
-	items, err := doclingHybridChunksToItems(decoded.Chunks, content)
-	if err != nil {
-		return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid provenance: %w", err)}
+	items := []DocItem(nil)
+	if len(decoded.Chunks) > 0 {
+		items, err = doclingHybridChunksToItems(decoded.Chunks, content)
+		if err != nil {
+			return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid provenance: %w", err)}
+		}
+	}
+	warnings := []string(nil)
+	previewSourceCount := 0
+	if p.fileType == utility.FileTypePPTX {
+		if len(decoded.Chunks) == 0 {
+			warnings = append(warnings, "Docling returned no semantic chunks; indexed native full-slide previews only")
+		}
+		previewItems, previewWarnings, previewErr := doclingPresentationPreviewItems(ctx, filename, data)
+		if previewErr != nil {
+			return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid presentation preview source: %w", previewErr)}
+		}
+		previewSourceCount = len(previewItems)
+		items = append(items, previewItems...)
+		warnings = append(warnings, previewWarnings...)
 	}
 	return ParseResult{
 		File: map[string]any{
-			"name":                    filename,
-			"format":                  string(p.fileType),
-			"page_count":              doclingHybridPageCount(content),
-			"docling_processing_time": decoded.ProcessingTime,
+			"name":                         filename,
+			"format":                       string(p.fileType),
+			"page_count":                   doclingHybridPageCount(content),
+			"docling_processing_time":      decoded.ProcessingTime,
+			"presentation_preview_sources": previewSourceCount,
 		},
-		JSON: items,
+		JSON:     items,
+		Warnings: warnings,
 	}
+}
+
+// emptyPDFChunksFallback retains a successfully converted PDF when Docling's
+// HybridChunker returns no boundaries. Every native record is marked so the
+// downstream hybrid chunker can merge it page-by-page, render the original
+// PDF page, run local OCR where needed, and keep the page preview linked to the
+// contextualized text. This is a recovery path, not an alternate default.
+func (p *DoclingHybridParser) emptyPDFChunksFallback(ctx context.Context, filename string, data []byte) ParseResult {
+	parsed := doclingNativePDFParse(ctx, filename, data)
+	if parsed.Err != nil {
+		return ParseResult{Err: fmt.Errorf("parser: Docling Hybrid empty-chunk native PDF fallback: %w", parsed.Err)}
+	}
+	maps := ItemsToMaps(parsed.JSON)
+	if !nativeItemsContainSemanticText(maps) {
+		return ParseResult{Err: errors.New("parser: Docling Hybrid empty-chunk native PDF fallback produced no semantic text")}
+	}
+	for _, item := range maps {
+		item["docling_native_pdf_fallback"] = true
+	}
+	file := make(map[string]any, len(parsed.File)+3)
+	for key, value := range parsed.File {
+		file[key] = value
+	}
+	file["name"] = filename
+	file["format"] = string(p.fileType)
+	file["docling_native_pdf_fallback"] = true
+	warnings := append([]string(nil), parsed.Warnings...)
+	warnings = append(warnings, "Docling returned no hybrid chunks; used native PDF text/OCR fallback with page previews")
+	return ParseResult{File: file, JSON: MapsToItems(maps), Warnings: warnings}
+}
+
+func nativeItemsContainSemanticText(items []map[string]any) bool {
+	for _, item := range items {
+		if strings.TrimSpace(nativePresentationSemanticText(item)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// oversizedPresentationFallback keeps very large decks in the contextual
+// pipeline when Docling's converted-document JSON alone exceeds the bounded
+// response limit. The native office parser reads the PPTX once, its visible
+// text and tables are collapsed into bounded slide-scoped semantic chunks,
+// and the same native records remain private inputs for full-slide previews.
+// This is deliberately PPTX-only: unlike PDFs, presentations already have a
+// deterministic native slide model and preview renderer in this process.
+func (p *DoclingHybridParser) oversizedPresentationFallback(ctx context.Context, filename string, data []byte) ParseResult {
+	parsed := doclingPresentationParse(ctx, filename, data)
+	if parsed.Err != nil {
+		return ParseResult{Err: fmt.Errorf("parser: oversized presentation native fallback: %w", parsed.Err)}
+	}
+	maps := ItemsToMaps(parsed.JSON)
+	semantic, pageCount := nativePresentationSemanticItems(maps)
+	if len(semantic) == 0 {
+		return ParseResult{Err: errors.New("parser: oversized presentation native fallback produced no semantic text")}
+	}
+	preview := make([]map[string]any, 0, len(maps))
+	for _, source := range maps {
+		item := make(map[string]any, len(source)+1)
+		for key, value := range source {
+			item[key] = value
+		}
+		item[doclingPresentationPreviewSourceKey] = true
+		preview = append(preview, item)
+	}
+	semantic = append(semantic, preview...)
+	warnings := append([]string(nil), parsed.Warnings...)
+	warnings = append(warnings, "Docling converted response exceeded the bounded byte limit; used native slide-scoped semantic fallback")
+	return ParseResult{
+		File: map[string]any{
+			"name":                             filename,
+			"format":                           string(p.fileType),
+			"page_count":                       pageCount,
+			"presentation_preview_sources":     len(preview),
+			"docling_native_semantic_fallback": true,
+			"docling_native_semantic_fallback_reason": "response_too_large",
+		},
+		JSON:     MapsToItems(semantic),
+		Warnings: warnings,
+	}
+}
+
+func nativePresentationSemanticItems(items []map[string]any) ([]map[string]any, int) {
+	byPage := make(map[int][]string)
+	order := make([]int, 0)
+	seen := make(map[int]struct{})
+	pageCount := 0
+	for _, item := range items {
+		page := nativePresentationPageNumber(item)
+		if page <= 0 {
+			continue
+		}
+		if page > pageCount {
+			pageCount = page
+		}
+		text := strings.TrimSpace(nativePresentationSemanticText(item))
+		if text == "" {
+			continue
+		}
+		if _, ok := seen[page]; !ok {
+			seen[page] = struct{}{}
+			order = append(order, page)
+		}
+		byPage[page] = append(byPage[page], text)
+	}
+	out := make([]map[string]any, 0, len(order))
+	for _, page := range order {
+		for _, text := range splitNativePresentationSemanticText(strings.Join(byPage[page], "\n\n"), nativePresentationSemanticMaxRunes) {
+			out = append(out, map[string]any{
+				"text":                             text,
+				DocTypeKey:                         DocTypeText,
+				"page_number":                      page,
+				"slide_number":                     page,
+				"docling_page_numbers":             []int{page},
+				"docling_native_semantic_fallback": true,
+			})
+		}
+	}
+	return out, pageCount
+}
+
+func nativePresentationSemanticText(item map[string]any) string {
+	if text, _ := item["text"].(string); strings.TrimSpace(text) != "" {
+		return text
+	}
+	if table, ok := item["table"].(*entity.TableData); ok && table != nil {
+		return tableutil.RenderTableHTML(table)
+	}
+	return ""
+}
+
+func nativePresentationPageNumber(item map[string]any) int {
+	switch value := item["slide_number"].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		page, _ := strconv.Atoi(value.String())
+		return page
+	default:
+		return 0
+	}
+}
+
+func splitNativePresentationSemanticText(text string, maxRunes int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" || maxRunes <= 0 {
+		return nil
+	}
+	runes := []rune(text)
+	parts := make([]string, 0, len(runes)/maxRunes+1)
+	for len(runes) > 0 {
+		cut := len(runes)
+		if cut > maxRunes {
+			cut = maxRunes
+			// Prefer a nearby line boundary without producing a tiny prefix.
+			for index := cut - 1; index >= cut/2; index-- {
+				if runes[index] == '\n' {
+					cut = index + 1
+					break
+				}
+			}
+		}
+		if part := strings.TrimSpace(string(runes[:cut])); part != "" {
+			parts = append(parts, part)
+		}
+		runes = runes[cut:]
+	}
+	return parts
+}
+
+// doclingPresentationPreviewItems parses the same PPTX bytes with RAGFlow's
+// built-in office_oxide backend and marks the resulting geometry/media items
+// as private preview sources. DoclingHybridChunker consumes the marker and
+// turns these records into one full-slide image chunk per slide; the marked
+// source records never reach the index themselves.
+func doclingPresentationPreviewItems(ctx context.Context, filename string, data []byte) ([]DocItem, []string, error) {
+	result := doclingPresentationParse(ctx, filename, data)
+	if result.Err != nil {
+		return nil, nil, result.Err
+	}
+	maps := ItemsToMaps(result.JSON)
+	if len(maps) == 0 {
+		return nil, nil, errors.New("native presentation parser produced no slide records")
+	}
+	for _, item := range maps {
+		item[doclingPresentationPreviewSourceKey] = true
+	}
+	return MapsToItems(maps), result.Warnings, nil
 }
 
 func (p *DoclingHybridParser) requestDocling(ctx context.Context, client *http.Client, endpoint, auth string, payload map[string]any) ([]byte, error) {
@@ -236,11 +485,13 @@ func (p *DoclingHybridParser) requestDocling(ctx context.Context, client *http.C
 			return fmt.Errorf("read Docling response: %w", readErr)
 		}
 		if int64(len(body)) > maxBytes {
-			return fmt.Errorf("Docling response exceeds configured %s=%d bytes", common.EnvDoclingResponseMaxBytes, maxBytes)
+			return fmt.Errorf("%w: %s=%d bytes", errDoclingResponseTooLarge, common.EnvDoclingResponseMaxBytes, maxBytes)
 		}
 		responseBody = body
 		return nil
-	}, common.IsTransientError)
+	}, func(err error) bool {
+		return !errors.Is(err, errDoclingResponseTooLarge) && common.IsTransientError(err)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -383,11 +634,19 @@ func doclingHybridErrorSummary(errors []doclingHybridError) string {
 
 func (p *DoclingHybridParser) requestPayload(filename string, data []byte) (map[string]any, error) {
 	format := doclingHybridInputFormat(p.fileType)
+	includeImages := p.fileType != utility.FileTypePPTX
+	imageExportMode := "embedded"
+	if !includeImages {
+		// PPTX media is rendered faithfully by the native full-slide preview
+		// path below. Re-embedding every source image in Docling's converted JSON
+		// can exceed hundreds of MiB without adding a second useful preview.
+		imageExportMode = "placeholder"
+	}
 	convertOptions := map[string]any{
 		"from_formats":      []string{format},
 		"to_formats":        []string{"json"},
-		"include_images":    true,
-		"image_export_mode": "embedded",
+		"include_images":    includeImages,
+		"image_export_mode": imageExportMode,
 	}
 	if value, ok := doclingEnvBool(common.EnvDoclingDoOCR); ok {
 		convertOptions["do_ocr"] = value

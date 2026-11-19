@@ -135,6 +135,7 @@ func doclingHybridSupports(fileType utility.FileType) bool {
 		utility.FileTypePPTX,
 		utility.FileTypeXLSX,
 		utility.FileTypeCSV,
+		utility.FileTypeMarkdown,
 		utility.FileTypeVISUAL:
 		return true
 	default:

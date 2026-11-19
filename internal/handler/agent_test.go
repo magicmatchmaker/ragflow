@@ -872,12 +872,14 @@ type stubChatRunner struct {
 	events           []canvas.RunEvent
 	err              error
 	sessionID        string
+	versionID        string
 	trustedSessionID string
 	userInput        any
 }
 
-func (s *stubChatRunner) RunAgent(ctx context.Context, _, sessionID, _ string, userInput any, _ []map[string]interface{}) (<-chan canvas.RunEvent, error) {
+func (s *stubChatRunner) RunAgent(ctx context.Context, _, sessionID, versionID string, userInput any, _ []map[string]interface{}) (<-chan canvas.RunEvent, error) {
 	s.sessionID = sessionID
+	s.versionID = versionID
 	s.trustedSessionID = service.AgentSessionIDFromContext(ctx)
 	s.userInput = userInput
 	if s.err != nil {
@@ -889,6 +891,89 @@ func (s *stubChatRunner) RunAgent(ctx context.Context, _, sessionID, _ string, u
 	}
 	close(ch)
 	return ch, nil
+}
+
+func TestAgentChatCompletions_PinsPublishedVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/api/v1/agents/chat/completions",
+		strings.NewReader(`{"agent_id":"a1","version_id":"11111111111111111111111111111111","query":"hi"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &entity.User{ID: "u1"})
+	c.Set("user_id", "u1")
+
+	runner := &stubChatRunner{events: []canvas.RunEvent{{Type: "done"}}}
+	(&AgentHandler{chatRunner: runner}).AgentChatCompletions(c)
+
+	if runner.versionID != "11111111111111111111111111111111" {
+		t.Fatalf("version id = %q, want pinned published version", runner.versionID)
+	}
+}
+
+func TestAgentChatCompletions_VersionIDRequiresReleasedVersion(t *testing.T) {
+	c, w, db := setupGinContextWithUserAndDB(t, "POST", "/api/v1/agents/chat/completions")
+	c.Request = httptest.NewRequest(
+		"POST",
+		"/api/v1/agents/chat/completions",
+		strings.NewReader(`{"agent_id":"canvas-production","version_id":"version-unreleased","query":"must not run"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request = c.Request.WithContext(permission.WithIdentity(c.Request.Context(), "user-1", "user-1"))
+	if err := db.Create(&entity.UserCanvas{
+		ID:             "canvas-production",
+		UserID:         "user-1",
+		CanvasCategory: "agent_canvas",
+		Title:          sptr("Production Agent"),
+	}).Error; err != nil {
+		t.Fatalf("create production canvas: %v", err)
+	}
+	if err := db.Create(&entity.UserCanvasVersion{
+		ID:           "version-unreleased",
+		UserCanvasID: "canvas-production",
+		Release:      false,
+		DSL:          entity.JSONMap{},
+	}).Error; err != nil {
+		t.Fatalf("create unreleased version: %v", err)
+	}
+
+	NewAgentHandler(t.Context(), service.NewAgentService(), nil).AgentChatCompletions(c)
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response %q: %v", w.Body.String(), err)
+	}
+	if code, _ := response["code"].(float64); code != float64(common.CodeOperatingError) {
+		t.Fatalf("response code = %v, want %d: %s", code, common.CodeOperatingError, w.Body.String())
+	}
+	var sessions int64
+	if err := db.Model(&entity.API4Conversation{}).Where("dialog_id = ?", "canvas-production").Count(&sessions).Error; err != nil {
+		t.Fatalf("count production sessions: %v", err)
+	}
+	if sessions != 0 {
+		t.Fatalf("unreleased production request created %d sessions, want 0", sessions)
+	}
+}
+
+func TestAgentChatCompletions_OpenAICompatForwardsPinnedVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		"POST",
+		"/api/v1/agents/chat/completions",
+		strings.NewReader(`{"agent_id":"a1","version_id":"11111111111111111111111111111111","openai-compatible":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &entity.User{ID: "u1"})
+	c.Set("user_id", "u1")
+
+	runner := &stubChatRunner{events: []canvas.RunEvent{{Type: "done"}}}
+	(&AgentHandler{chatRunner: runner}).AgentChatCompletions(c)
+
+	if runner.versionID != "11111111111111111111111111111111" {
+		t.Fatalf("OpenAI-compatible version id = %q, want pinned published version", runner.versionID)
+	}
 }
 
 // TestAgentChatCompletions_StreamSetsContentType covers the SSE

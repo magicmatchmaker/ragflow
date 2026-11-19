@@ -4,6 +4,7 @@
 package parser
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -226,6 +227,31 @@ func TestDoclingPictureDescriptionDoesNotSkipSmallTechnicalImagesByDefault(t *te
 	api := convert["picture_description_api"].(map[string]any)
 	if api["timeout"] != defaultDoclingPictureDescriptionTimeout || api["concurrency"] != defaultDoclingPictureDescriptionWorkers {
 		t.Fatalf("picture API defaults = %#v", api)
+	}
+}
+
+func TestDoclingPPTXRequestUsesNativePreviewInsteadOfEmbeddingAllSourceImages(t *testing.T) {
+	p := NewDoclingHybridParser(utility.FileTypePPTX)
+	payload, err := p.requestPayload("large-deck.pptx", []byte("pptx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	convert := payload["convert_options"].(map[string]any)
+	if convert["include_images"] != false || convert["image_export_mode"] != "placeholder" {
+		t.Fatalf("PPTX convert options = %#v, want native-preview media ownership", convert)
+	}
+}
+
+func TestDoclingMarkdownRequestUsesMarkdownInputFormat(t *testing.T) {
+	p := NewDoclingHybridParser(utility.FileTypeMarkdown)
+	payload, err := p.requestPayload("knowledge.md", []byte("# Knowledge"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	convert := payload["convert_options"].(map[string]any)
+	formats := convert["from_formats"].([]string)
+	if len(formats) != 1 || formats[0] != "md" {
+		t.Fatalf("Markdown from_formats = %#v, want [md]", formats)
 	}
 }
 
@@ -498,6 +524,9 @@ func TestDoclingRequestHasNoImplicitDeadlineAndCapsResponse(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "DOCLING_RESPONSE_MAX_BYTES=8") {
 		t.Fatalf("error = %v, want explicit response size failure", err)
 	}
+	if !errors.Is(err, errDoclingResponseTooLarge) {
+		t.Fatalf("error = %v, want errDoclingResponseTooLarge", err)
+	}
 	if hadDeadline.Load() {
 		t.Fatal("unset/zero request timeout installed an implicit per-attempt deadline")
 	}
@@ -510,5 +539,140 @@ func TestDoclingHybridGenerationTextSupportsDescriptionOnlyImagesWithoutDuplicat
 	}
 	if got := doclingHybridGenerationText("화면: "+description, []string{description}); strings.Count(got, description) != 1 {
 		t.Fatalf("description duplicated in %q", got)
+	}
+}
+
+func TestDoclingPresentationPreviewItemsMarksNativeSources(t *testing.T) {
+	previous := doclingPresentationParse
+	doclingPresentationParse = func(context.Context, string, []byte) ParseResult {
+		return ParseResult{
+			JSON: MapsToItems([]map[string]any{
+				{"text": "슬라이드 제목", DocTypeKey: DocTypeText, "slide_number": 1},
+				{"text": "장비 사진", DocTypeKey: DocTypeImage, "image": "data:image/png;base64,aW1n", "slide_number": 1},
+			}),
+			Warnings: []string{"preview warning"},
+		}
+	}
+	t.Cleanup(func() { doclingPresentationParse = previous })
+
+	items, warnings, err := doclingPresentationPreviewItems(t.Context(), "deck.pptx", []byte("pptx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || len(warnings) != 1 {
+		t.Fatalf("items=%d warnings=%#v", len(items), warnings)
+	}
+	for index, item := range ItemsToMaps(items) {
+		if marked, _ := item[doclingPresentationPreviewSourceKey].(bool); !marked {
+			t.Fatalf("item %d marker = %#v", index, item[doclingPresentationPreviewSourceKey])
+		}
+	}
+}
+
+func TestNativePresentationSemanticItemsAreSlideScopedAndBounded(t *testing.T) {
+	long := strings.Repeat("가", nativePresentationSemanticMaxRunes+25)
+	items, pageCount := nativePresentationSemanticItems([]map[string]any{
+		{"text": "첫 슬라이드 제목", DocTypeKey: DocTypeText, "slide_number": 1},
+		{"text": "", DocTypeKey: DocTypeImage, "image": "data:image/png;base64,aW1n", "slide_number": 1},
+		{"text": long, DocTypeKey: DocTypeText, "slide_number": 2},
+	})
+	if pageCount != 2 {
+		t.Fatalf("pageCount = %d, want 2", pageCount)
+	}
+	if len(items) != 3 {
+		t.Fatalf("semantic items = %d, want one slide-1 and two bounded slide-2 chunks", len(items))
+	}
+	for index, item := range items {
+		text, _ := item["text"].(string)
+		if strings.TrimSpace(text) == "" || len([]rune(text)) > nativePresentationSemanticMaxRunes {
+			t.Fatalf("item %d text runes = %d", index, len([]rune(text)))
+		}
+		if item["docling_native_semantic_fallback"] != true {
+			t.Fatalf("item %d missing fallback marker: %#v", index, item)
+		}
+	}
+	if got := items[0]["docling_page_numbers"]; len(got.([]int)) != 1 || got.([]int)[0] != 1 {
+		t.Fatalf("slide-1 provenance = %#v", got)
+	}
+}
+
+func TestEmptyDoclingPDFChunksUseMarkedNativeFallback(t *testing.T) {
+	previous := doclingNativePDFParse
+	doclingNativePDFParse = func(context.Context, string, []byte) ParseResult {
+		return ParseResult{
+			File: map[string]any{"page_count": 2},
+			JSON: MapsToItems([]map[string]any{
+				{"text": "ITM expiration settings", DocTypeKey: DocTypeText, "page_number": 1},
+				{"text": "timestamp verification", DocTypeKey: DocTypeText, "page_number": 2},
+			}),
+			Warnings: []string{"native warning"},
+		}
+	}
+	t.Cleanup(func() { doclingNativePDFParse = previous })
+
+	result := NewDoclingHybridParser(utility.FileTypePDF).emptyPDFChunksFallback(t.Context(), "itm.pdf", []byte("pdf"))
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result.File["docling_native_pdf_fallback"] != true || result.File["format"] != "pdf" {
+		t.Fatalf("file metadata = %#v", result.File)
+	}
+	for index, item := range ItemsToMaps(result.JSON) {
+		if marked, _ := item["docling_native_pdf_fallback"].(bool); !marked {
+			t.Fatalf("item %d missing native PDF marker: %#v", index, item)
+		}
+	}
+	if len(result.Warnings) != 2 || !strings.Contains(result.Warnings[1], "page previews") {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+}
+
+func TestEmptyDoclingPDFChunksRejectEmptyNativeFallback(t *testing.T) {
+	previous := doclingNativePDFParse
+	doclingNativePDFParse = func(context.Context, string, []byte) ParseResult {
+		return ParseResult{JSON: MapsToItems([]map[string]any{{"text": ""}})}
+	}
+	t.Cleanup(func() { doclingNativePDFParse = previous })
+
+	result := NewDoclingHybridParser(utility.FileTypePDF).emptyPDFChunksFallback(t.Context(), "empty.pdf", []byte("pdf"))
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "produced no semantic text") {
+		t.Fatalf("error = %v", result.Err)
+	}
+}
+
+func TestOversizedPresentationFallbackKeepsSemanticAndPreviewSources(t *testing.T) {
+	previous := doclingPresentationParse
+	doclingPresentationParse = func(context.Context, string, []byte) ParseResult {
+		return ParseResult{
+			JSON: MapsToItems([]map[string]any{
+				{"text": "ALARM reset procedure", DocTypeKey: DocTypeText, "slide_number": 3},
+				{"text": "HMI screenshot", DocTypeKey: DocTypeImage, "image": "data:image/png;base64,aW1n", "slide_number": 3},
+			}),
+			Warnings: []string{"native warning"},
+		}
+	}
+	t.Cleanup(func() { doclingPresentationParse = previous })
+
+	result := NewDoclingHybridParser(utility.FileTypePPTX).oversizedPresentationFallback(t.Context(), "huge.pptx", []byte("pptx"))
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result.File["docling_native_semantic_fallback"] != true || result.File["page_count"] != 3 {
+		t.Fatalf("file metadata = %#v", result.File)
+	}
+	maps := ItemsToMaps(result.JSON)
+	semantic, preview := 0, 0
+	for _, item := range maps {
+		if marked, _ := item[doclingPresentationPreviewSourceKey].(bool); marked {
+			preview++
+		} else {
+			semantic++
+		}
+	}
+	if semantic != 1 || preview != 2 {
+		t.Fatalf("semantic=%d preview=%d maps=%#v", semantic, preview, maps)
+	}
+	if len(result.Warnings) != 2 || !strings.Contains(result.Warnings[1], "bounded byte limit") {
+		t.Fatalf("warnings = %#v", result.Warnings)
 	}
 }

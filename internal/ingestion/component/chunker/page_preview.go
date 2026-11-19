@@ -71,6 +71,11 @@ const (
 
 var (
 	presentationFontOnce sync.Once
+	// opentype.Face keeps mutable glyph-loading buffers and is not safe for
+	// concurrent use. Presentation ingestion runs several documents in
+	// parallel, so sharing the face without serialization can corrupt those
+	// buffers and panic inside sfnt.LoadGlyph.
+	presentationFontMu   sync.Mutex
 	presentationFontFace font.Face = basicfont.Face7x13
 )
 
@@ -130,7 +135,9 @@ func composePresentationPreview(ctx context.Context, items []schema.ChunkDoc) ([
 			dst = fallbackPresentationTextRect(textIndex, width, height)
 			textIndex++
 		}
-		drawPresentationText(canvas, dst, text)
+		if err := drawPresentationText(canvas, dst, text); err != nil {
+			composeErrors = append(composeErrors, err)
+		}
 	}
 	if mediaCount > 0 && renderedMedia == 0 && len(composeErrors) == 0 {
 		composeErrors = append(composeErrors, errors.New("presentation media produced no visible preview"))
@@ -276,17 +283,28 @@ func encodeBoundedPresentationImage(source image.Image) ([]byte, error) {
 	return encoded.Bytes(), nil
 }
 
-func drawPresentationText(dst *image.RGBA, rect image.Rectangle, text string) {
+func drawPresentationText(dst *image.RGBA, rect image.Rectangle, text string) (err error) {
+	// Keep a malformed font/glyph from aborting the entire document. The slide
+	// preview remains useful with its other text and images, and the caller logs
+	// this as a partial rendering error.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errors.New("presentation text renderer panicked")
+		}
+	}()
+	presentationFontMu.Lock()
+	defer presentationFontMu.Unlock()
+
 	rect = rect.Intersect(dst.Bounds())
 	if rect.Dx() < 8 || rect.Dy() < 8 || text == "" {
-		return
+		return nil
 	}
 	face := getPresentationFontFace()
 	lineHeight := max(1, face.Metrics().Height.Ceil())
 	maxLines := max(1, (rect.Dy()-8)/lineHeight)
 	lines := wrapPresentationText(text, face, max(1, rect.Dx()-8), maxLines)
 	if len(lines) == 0 {
-		return
+		return nil
 	}
 	// A translucent white backing keeps text readable over screenshots while
 	// preserving the image underneath and its alpha compositing.
@@ -299,6 +317,7 @@ func drawPresentationText(dst *image.RGBA, rect image.Rectangle, text string) {
 		drawer.DrawString(line)
 		y += lineHeight
 	}
+	return nil
 }
 
 func fixedPoint(x, y int) fixed.Point26_6 {
