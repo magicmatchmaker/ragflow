@@ -165,6 +165,48 @@ func TestAgent_PopulatesStructuredFromOutputsSchema(t *testing.T) {
 	}
 }
 
+func TestAgent_EnforcesStructuredOutputThroughProviderWhenDraftIsMarkdown(t *testing.T) {
+	withAgentRunner(t, func(_ context.Context, _ AgentParam) (*schema.Message, error) {
+		return &schema.Message{Role: schema.Assistant, Content: "Grounded prose [ID:chunk-1]"}, nil
+	})
+	stub := &stubInvoker{resp: &ChatInvokeResponse{
+		Content: `{"summary":"Grounded prose","citation_ids":["chunk-1"]}`,
+		Model:   "stub",
+	}}
+	withStubInvoker(t, stub)
+
+	c := NewAgentComponent(agentParamFromMap(map[string]any{
+		"model_id": "stub",
+		"outputs": map[string]any{
+			"structured": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"summary":      map[string]any{"type": "string"},
+					"citation_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+				"required": []any{"summary", "citation_ids"},
+			},
+		},
+	}))
+	out, err := c.Invoke(t.Context(), nil, map[string]any{"user_prompt": "question"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if got := out["content"]; got != `{"summary":"Grounded prose","citation_ids":["chunk-1"]}` {
+		t.Fatalf("content=%v", got)
+	}
+	if stub.calls != 1 || stub.captured == nil {
+		t.Fatalf("provider structured call count=%d request=%#v", stub.calls, stub.captured)
+	}
+	if stub.captured.ResponseFormat["type"] != "json_schema" {
+		t.Fatalf("response_format=%#v", stub.captured.ResponseFormat)
+	}
+	if !strings.Contains(stub.captured.Messages[1].Content, "Grounded prose [ID:chunk-1]") {
+		t.Fatalf("grounded draft missing from provider request: %#v", stub.captured.Messages)
+	}
+}
+
 func TestAgentOutputStructureFromPreservesSchema(t *testing.T) {
 	schema := agentOutputStructureFrom(map[string]any{
 		"outputs": map[string]any{

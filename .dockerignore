@@ -62,7 +62,8 @@ docker/.env
 
 # ── Local build artifacts / caches (never needed inside the container) ──
 # Go build output (binaries are compiled fresh inside the go-builder stage).
-/bin/
+/bin/*
+!/bin/ragflow_server
 # Local Go module cache (go mod download runs inside the container via cache mount).
 /gomod_cache/
 # Local model backups / superseded exports in deepdoc_ee_models/.

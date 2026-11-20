@@ -96,6 +96,10 @@ type Request struct {
 	FrequencyPenalty *float64
 	MaxTokens        *int
 	Thinking         string // "enabled" | "disabled" | ""
+	// ResponseFormat is forwarded to OpenAI-compatible providers as
+	// response_format. It is used for provider-enforced JSON/JSON-Schema
+	// output rather than relying on prompt-only best effort parsing.
+	ResponseFormat map[string]any
 	// Tools, when non-nil, switches the call from prompt-based tool parsing to
 	// native provider tool calling. ToolChoice constrains the provider's use of
 	// them (see ToolChoice). Nil means no tools are declared.

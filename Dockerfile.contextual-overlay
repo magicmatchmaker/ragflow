@@ -1,8 +1,7 @@
-FROM kwonnam/ragflow:v1.0.0-contextual.12
+FROM kwonnam/ragflow:v1.0.0-contextual.17
 
 USER root
 COPY --chmod=0755 bin/ragflow_server /ragflow/bin/ragflow_server
 
-LABEL com.kwonnam.ragflow.release="contextual.17" \
-	  org.opencontainers.image.revision="0b17fb3dd33f53456c3762d15d4f2921ebbce548+contextual-image-only-recovery" \
-	  org.opencontainers.image.description="RAGFlow v1.0.0 with contextual Markdown, bounded oversized-PPTX fallback, native PDF recovery, and OCR-backed image-only slide evidence"
+LABEL com.kwonnam.ragflow.release="contextual.18" \
+	  org.opencontainers.image.description="RAGFlow v1.0.0 with provider-enforced JSON Schema output for grounded Agent answers"

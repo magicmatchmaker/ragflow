@@ -1206,21 +1206,26 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 		if !ok {
 			parsed, ok = matchAgentOutputStructure(content, p.OutputStructure)
 		}
-		if ok {
-			out["structured"] = parsed
-			out["content"] = cleaned + artifactMD
-			content = cleaned
-		} else {
-			common.Warn("component: Agent: outputs.structured set but no parseable JSON matching schema",
-				zap.Strings("expected_keys", sortedMapKeys(structuredExpectedKeySet(p.OutputStructure))))
+		if !ok {
+			var err error
+			cleaned, parsed, err = enforceAgentOutputStructure(ctx, db, p, content)
+			if err != nil {
+				return nil, err
+			}
 		}
+		out["structured"] = parsed
+		// Structured content must remain a single valid JSON document. Tool
+		// artifacts stay available through outputs["artifacts"] instead of being
+		// appended as Markdown after the JSON body.
+		out["content"] = cleaned
+		content = cleaned
 	}
 	streamed := runtime.AgentMessageEventsEmitted(ctx) || runtime.DeferredAgentMessageEventsEmitted(ctx)
 	switch {
 	case structuredHeld:
 		// Content deltas were held above; emit the normalized body once so the
 		// live stream matches outputs["content"] (no fenced/raw mismatch).
-		runtime.EmitAgentMessage(ctx, content+artifactMD, "")
+		runtime.EmitAgentMessage(ctx, content, "")
 	case !streamed:
 		runtime.EmitAgentMessage(ctx, content+artifactMD, thinking)
 	case artifactMD != "":
@@ -1233,6 +1238,54 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 		runtime.EmitAgentMessage(ctx, artifactMD, "")
 	}
 	return out, nil
+}
+
+func enforceAgentOutputStructure(
+	ctx context.Context,
+	db *gorm.DB,
+	p AgentParam,
+	groundedDraft string,
+) (string, map[string]any, error) {
+	if len(p.OutputStructure) == 0 {
+		return "", nil, fmt.Errorf("component: Agent structured output schema is empty")
+	}
+	temperature := 0.0
+	inv := getDefaultChatInvoker()
+	resp, err := inv.Invoke(ctx, db, ChatInvokeRequest{
+		Driver:    p.Driver,
+		ModelName: p.ModelID,
+		APIKey:    p.APIKey,
+		BaseURL:   p.BaseURL,
+		Messages: []schema.Message{
+			{
+				Role:    schema.System,
+				Content: "Transform the supplied grounded draft into the required JSON Schema. Preserve the draft's facts, uncertainty, and citation identifiers exactly. Do not add facts, sources, or citation identifiers. Return only the JSON object.",
+			},
+			{
+				Role:    schema.User,
+				Content: "Original question:\n" + p.UserPrompt + "\n\nGrounded draft:\n" + groundedDraft,
+			},
+		},
+		Temperature:    &temperature,
+		MaxTokens:      p.MaxTokens,
+		Thinking:       "disabled",
+		ResponseFormat: jsonSchemaResponseFormat("ragflow_agent_answer", p.OutputStructure),
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("component: Agent provider-enforced structured output: %w", err)
+	}
+	if resp == nil {
+		return "", nil, fmt.Errorf("component: Agent provider-enforced structured output returned no response")
+	}
+	cleaned := strings.TrimSpace(cleanFormattedAnswer(resp.Content))
+	parsed, ok := matchAgentOutputStructure(cleaned, p.OutputStructure)
+	if !ok {
+		return "", nil, fmt.Errorf(
+			"component: Agent provider returned output that does not match the configured JSON Schema (expected keys: %s)",
+			strings.Join(sortedMapKeys(structuredExpectedKeySet(p.OutputStructure)), ", "),
+		)
+	}
+	return cleaned, parsed, nil
 }
 
 // Stream implements Component.Stream. Mirrors Invoke then pushes the

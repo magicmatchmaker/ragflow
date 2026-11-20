@@ -115,6 +115,13 @@ func TestLLM_Invoke_OutputStructure_ValidFirstTry(t *testing.T) {
 	if stub.calls != 1 {
 		t.Errorf("expected 1 call (no retry), got %d", stub.calls)
 	}
+	if stub.captured == nil || stub.captured.ResponseFormat["type"] != "json_schema" {
+		t.Fatalf("response_format was not forwarded as json_schema: %#v", stub.captured)
+	}
+	jsonSchema, ok := stub.captured.ResponseFormat["json_schema"].(map[string]any)
+	if !ok || jsonSchema["strict"] != true || jsonSchema["schema"] == nil {
+		t.Fatalf("invalid provider JSON Schema request: %#v", stub.captured.ResponseFormat)
+	}
 	structured, ok := out["structured"].(map[string]any)
 	if !ok {
 		t.Fatalf("structured not populated; out=%+v", out)

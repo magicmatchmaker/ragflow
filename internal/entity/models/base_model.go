@@ -588,6 +588,9 @@ func buildRequestBody(cfg *ChatConfig, modelName string, messages []Message, str
 		setOpt(reqBody, "frequency_penalty", cfg.FrequencyPenalty)
 		setOpt(reqBody, "max_tokens", cfg.MaxTokens)
 		setOpt(reqBody, "stop", cfg.Stop)
+		if len(cfg.ResponseFormat) > 0 {
+			reqBody["response_format"] = cfg.ResponseFormat
+		}
 
 		if cfg.Tools != nil {
 			reqBody["tools"] = cfg.Tools

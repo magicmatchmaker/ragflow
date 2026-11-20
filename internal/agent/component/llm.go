@@ -220,9 +220,10 @@ func (e *einoChatInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvok
 	cm := models.NewChatModel(d, &modelName, cfg)
 
 	chatCfg := &models.ChatConfig{
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		MaxTokens:   req.MaxTokens,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		MaxTokens:      req.MaxTokens,
+		ResponseFormat: req.ResponseFormat,
 	}
 	// Propagate the agent-level Thinking setting to the driver so
 	// providers like DeepSeek can send thinking: {type: "disabled"}
@@ -390,7 +391,12 @@ func (e *einoChatInvoker) Stream(ctx context.Context, _ *gorm.DB, req ChatInvoke
 	}
 	apiKey := req.APIKey
 	cm := models.NewChatModel(d, &bareModel, &models.APIConfig{ApiKey: &apiKey})
-	chatCfg := &models.ChatConfig{Temperature: req.Temperature, TopP: req.TopP, MaxTokens: req.MaxTokens}
+	chatCfg := &models.ChatConfig{
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		MaxTokens:      req.MaxTokens,
+		ResponseFormat: req.ResponseFormat,
+	}
 	switch req.Thinking {
 	case "enabled":
 		t := true
@@ -980,8 +986,33 @@ func (c *LLMComponent) prepareChatRequest(
 		FrequencyPenalty: p.FrequencyPenalty,
 		MaxTokens:        p.MaxTokens,
 		Thinking:         p.Thinking,
+		ResponseFormat:   responseFormatForLLMParam(p),
 	}
 	return inv, req, p, nil, nil
+}
+
+func responseFormatForLLMParam(p LLMParam) map[string]any {
+	if len(p.OutputStructure) > 0 {
+		return jsonSchemaResponseFormat("ragflow_structured_output", p.OutputStructure)
+	}
+	if p.JSONOutput {
+		return map[string]any{"type": "json_object"}
+	}
+	return nil
+}
+
+func jsonSchemaResponseFormat(name string, outputSchema map[string]any) map[string]any {
+	if len(outputSchema) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   name,
+			"strict": true,
+			"schema": outputSchema,
+		},
+	}
 }
 
 func (c *LLMComponent) postProcessResponse(
@@ -1038,6 +1069,7 @@ func (c *LLMComponent) postProcessResponse(
 				FrequencyPenalty: p.FrequencyPenalty,
 				MaxTokens:        p.MaxTokens,
 				Thinking:         p.Thinking,
+				ResponseFormat:   responseFormatForLLMParam(p),
 			})
 			if err == nil {
 				parsed, ok = matchOutputStructure(retryResp.Content, p.OutputStructure)

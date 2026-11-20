@@ -294,10 +294,14 @@ type ChatConfig struct {
 	ModelClass       *string
 	Effort           *string
 	Verbosity        *string
-	Tools            interface{}               `json:"tools,omitempty"`
-	ToolChoice       *string                   `json:"tool_choice,omitempty"`
-	ToolChoiceValue  any                       `json:"-"`
-	ToolCallsResult  *[]map[string]interface{} `json:"-"`
+	// ResponseFormat is the OpenAI-compatible response_format object. Keep it
+	// untyped here because providers accept both json_object and json_schema
+	// shapes and the schema body is supplied by the Agent/LLM component.
+	ResponseFormat  map[string]any            `json:"response_format,omitempty"`
+	Tools           interface{}               `json:"tools,omitempty"`
+	ToolChoice      *string                   `json:"tool_choice,omitempty"`
+	ToolChoiceValue any                       `json:"-"`
+	ToolCallsResult *[]map[string]interface{} `json:"-"`
 	// UsageResult receives the token usage extracted from the final
 	// streaming chunk when stream_options.include_usage is true.
 	// The ChatStreamlyWithSender driver writes to this pointer (if
